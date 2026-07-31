@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type DragEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import {
   AlertTriangle, ArchiveRestore, ArrowRight, Bell, Check, CheckCircle2, ChevronDown,
   Clipboard, CloudOff, Copy, Cpu, Download, File, FileText, FolderClock, Heart, History, Laptop, Link2,
@@ -7,7 +7,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { byteLength, classifyContent, contentHash, formatBytes, isSensitiveContent, relativeTime, validateFiles, validateText } from './lib/domain'
-import { isCloudConfigured, sendMagicLink } from './services/supabase'
+import { isCloudConfigured, sendCloudClipboard, signInWithPassword, signOutCloud, signUpWithPassword, startWorkspaceSync } from './services/supabase'
 import { useFlowStore } from './store/useFlowStore'
 import type { Activity, Device, Prompt, Transfer } from './types'
 
@@ -28,15 +28,18 @@ export function App() {
   const settings = useFlowStore((state) => state.settings)
   const updateTransfer = useFlowStore((state) => state.updateTransfer)
   const transfers = useFlowStore((state) => state.transfers)
+  const setCloudDevices = useFlowStore((state) => state.setCloudDevices)
+  const setCloudClipboard = useFlowStore((state) => state.setCloudClipboard)
+  const recordCloudClipboard = useFlowStore((state) => state.recordCloudClipboard)
   const [page, setPage] = useState<Page>('dashboard')
   const [toasts, setToasts] = useState<Toast[]>([])
   const runningTransfers = useRef(new Set<string>())
 
-  const notify = (message: string, tone: Toast['tone'] = 'success') => {
+  const notify = useCallback((message: string, tone: Toast['tone'] = 'success') => {
     const id = Date.now() + Math.random()
     setToasts((current) => [...current, { id, message, tone }])
     window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 3600)
-  }
+  }, [])
 
   useEffect(() => {
     const root = document.documentElement
@@ -46,6 +49,30 @@ export function App() {
     root.dataset.theme = resolved
     root.dataset.motion = settings.reduceMotion ? 'reduced' : 'full'
   }, [settings.theme, settings.reduceMotion])
+
+  useEffect(() => {
+    if (!onboarded || !isCloudConfigured) return
+    const currentDevice = useFlowStore.getState().devices.find((device) => device.isCurrent)
+    if (!currentDevice) return
+    let stopSync: (() => void) | undefined
+    let cancelled = false
+    void startWorkspaceSync({
+      deviceName: currentDevice.name,
+      onDevices: setCloudDevices,
+      onInitialClipboard: setCloudClipboard,
+      onIncomingClipboard: (item) => {
+        recordCloudClipboard(item, true)
+        const currentSettings = useFlowStore.getState().settings
+        if (currentSettings.autoWriteClipboard) void window.flowbridge?.writeClipboard(item.content)
+        if (currentSettings.textNotifications) notify('收到来自另一台设备的新文本')
+      },
+      onError: (message) => notify(`云端同步异常：${message}`, 'error'),
+    }).then((cleanup) => {
+      if (cancelled) cleanup()
+      else { stopSync = cleanup; notify('云端同步已连接') }
+    }).catch((error) => notify(error instanceof Error ? error.message : '连接云端失败', 'error'))
+    return () => { cancelled = true; stopSync?.() }
+  }, [notify, onboarded, recordCloudClipboard, setCloudClipboard, setCloudDevices])
 
   useEffect(() => {
     transfers.filter((transfer) => transfer.status === 'queued').forEach((transfer) => {
@@ -90,21 +117,29 @@ export function App() {
 
 function Onboarding({ notify }: { notify: (message: string, tone?: Toast['tone']) => void }) {
   const complete = useFlowStore((state) => state.completeOnboarding)
-  const [email, setEmail] = useState('creator@flowbridge.local')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
   const [deviceName, setDeviceName] = useState('这台电脑')
-  const [sending, setSending] = useState(false)
-  const [sent, setSent] = useState(false)
+  const [busy, setBusy] = useState<'login' | 'signup' | null>(null)
 
   useEffect(() => {
     void window.flowbridge?.getDeviceInfo().then((info) => setDeviceName(info.hostname)).catch(() => undefined)
   }, [])
 
-  const handleMagicLink = async () => {
+  const handleAuth = async (mode: 'login' | 'signup') => {
     if (!/^\S+@\S+\.\S+$/.test(email)) return notify('请输入有效邮箱', 'error')
-    setSending(true)
-    try { await sendMagicLink(email); setSent(true); notify('登录链接已发送，请检查邮箱') }
-    catch (error) { notify(error instanceof Error ? error.message : '发送失败', 'error') }
-    finally { setSending(false) }
+    if (password.length < 8) return notify('密码至少需要 8 位', 'error')
+    setBusy(mode)
+    try {
+      const session = mode === 'login'
+        ? await signInWithPassword(email, password)
+        : await signUpWithPassword(email, password)
+      if (!session) return notify('验证邮件已发送。请先在邮箱中确认，再回来点击登录', 'warning')
+      complete(email, deviceName)
+      notify(mode === 'login' ? '登录成功，正在连接设备' : '账号已创建，正在连接设备')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '登录失败', 'error')
+    } finally { setBusy(null) }
   }
 
   return (
@@ -130,11 +165,13 @@ function Onboarding({ notify }: { notify: (message: string, tone?: Toast['tone']
           <h2>连接你的工作空间</h2>
           <p>同一邮箱登录的设备会出现在彼此的设备列表中。</p>
           <label>邮箱地址<input value={email} onChange={(event) => setEmail(event.target.value)} type="email" placeholder="you@example.com" /></label>
+          <label>登录密码<input value={password} onChange={(event) => setPassword(event.target.value)} type="password" minLength={8} placeholder="至少 8 位；两台电脑使用同一密码" /></label>
           <label>这台设备的名称<input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} maxLength={40} /></label>
-          <button className="primary-button" onClick={handleMagicLink} disabled={sending || sent || !isCloudConfigured}>
-            {sending ? <LoaderCircle className="spin" size={18} /> : sent ? <Check size={18} /> : <Send size={18} />}
-            {sent ? '已发送登录链接' : isCloudConfigured ? '发送登录链接' : '云端尚未配置'}
+          <button className="primary-button" onClick={() => void handleAuth('login')} disabled={Boolean(busy) || !isCloudConfigured}>
+            {busy === 'login' ? <LoaderCircle className="spin" size={18} /> : <Send size={18} />}
+            {isCloudConfigured ? '登录并连接设备' : '云端尚未配置'}
           </button>
+          {isCloudConfigured && <button className="secondary-button demo-button" onClick={() => void handleAuth('signup')} disabled={Boolean(busy)}>{busy === 'signup' ? <LoaderCircle className="spin" size={18} /> : <Plus size={18} />}首次使用，创建同步账号</button>}
           <div className="divider"><span>或</span></div>
           <button className="secondary-button demo-button" onClick={() => complete(email, deviceName)}><Zap size={18} />进入可交互演示空间<ArrowRight size={17} /></button>
           <div className="demo-note"><CloudOff size={16} /><span>演示数据仅保存在本机。配置 <code>.env.local</code> 后可连接 Supabase。</span></div>
@@ -255,27 +292,45 @@ function QuickSend({ notify, onOpenFiles }: { notify: (message: string, tone?: T
   const selectedTargetId = useFlowStore((state) => state.selectedTargetId)
   const selectTarget = useFlowStore((state) => state.selectTarget)
   const sendText = useFlowStore((state) => state.sendText)
+  const recordCloudClipboard = useFlowStore((state) => state.recordCloudClipboard)
   const savePrompt = useFlowStore((state) => state.savePrompt)
   const createTransfers = useFlowStore((state) => state.createTransfers)
   const [text, setText] = useState('')
+  const [sendingText, setSendingText] = useState(false)
   const [isDragging, setDragging] = useState(false)
   const target = devices.find((device) => device.id === selectedTargetId)
   const error = text ? validateText(text) : null
   const sensitive = text ? isSensitiveContent(text) : false
 
-  const send = () => {
+  const send = async () => {
     const validation = validateText(text)
     if (validation) return notify(validation, 'error')
     if (sensitive && !window.confirm('内容可能包含验证码、密码或密钥。仍要发送吗？')) return
+    if (!target) return notify('请选择目标设备', 'warning')
+    if (isCloudConfigured) {
+      const currentDevice = devices.find((device) => device.isCurrent)
+      if (!currentDevice) return notify('当前设备尚未完成注册', 'error')
+      setSendingText(true)
+      try {
+        const item = await sendCloudClipboard({ sourceDeviceId: currentDevice.id, targetDeviceId: target.id, content: text })
+        recordCloudClipboard(item, false)
+        notify(`${item.contentType === 'prompt' ? 'Prompt' : '文本'}已发送至 ${target.name}`)
+        setText('')
+      } catch (error) {
+        notify(error instanceof Error ? error.message : '发送失败', 'error')
+      } finally { setSendingText(false) }
+      return
+    }
     const result = sendText(text)
     if (!result.ok) return notify(result.message, 'warning')
-    notify(`${result.item.contentType === 'prompt' ? 'Prompt' : '文本'}已发送至 ${target?.name}`)
+    notify(`${result.item.contentType === 'prompt' ? 'Prompt' : '文本'}已发送至 ${target.name}`)
     setText('')
   }
 
   const addFiles = (files: Array<{ name: string; size: number; type?: string; path?: string }>) => {
     const validation = validateFiles(files)
     if (validation) return notify(validation, 'error')
+    if (isCloudConfigured) return notify('联网版当前先支持真实文本互传；文件上传将在下一阶段接入', 'warning')
     const created = createTransfers(files)
     if (!created.length) return notify('同步已暂停或目标设备无效', 'warning')
     notify(`${created.length} 个文件已开始传输`)
@@ -300,7 +355,7 @@ function QuickSend({ notify, onOpenFiles }: { notify: (message: string, tone?: T
           <div className="composer-head"><span><Clipboard size={17} />发送文本</span><span>{formatBytes(byteLength(text))} / 1 MB</span></div>
           <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="粘贴 Prompt、链接或任何要继续使用的文本…" />
           {sensitive && <div className="inline-warning"><AlertTriangle size={15} />可能包含敏感内容，发送前请确认。</div>}
-          <div className="composer-actions"><div><button className="icon-button" onClick={async () => setText(window.flowbridge ? await window.flowbridge.readClipboard() : await navigator.clipboard.readText())} title="从剪贴板粘贴"><Clipboard size={17} /></button>{classifyContent(text) === 'prompt' && text && <span className="prompt-detected"><Sparkles size={13} />识别为 Prompt</span>}</div><div><button className="secondary-button compact" disabled={!text || Boolean(error)} onClick={() => { savePrompt(text); notify('已保存到 Prompt Library') }}><Star size={15} />保存</button><button className="primary-button compact" disabled={!text || Boolean(error)} onClick={send}>发送<Send size={15} /></button></div></div>
+          <div className="composer-actions"><div><button className="icon-button" onClick={async () => setText(window.flowbridge ? await window.flowbridge.readClipboard() : await navigator.clipboard.readText())} title="从剪贴板粘贴"><Clipboard size={17} /></button>{classifyContent(text) === 'prompt' && text && <span className="prompt-detected"><Sparkles size={13} />识别为 Prompt</span>}</div><div><button className="secondary-button compact" disabled={!text || Boolean(error) || sendingText} onClick={() => { savePrompt(text); notify('已保存到 Prompt Library') }}><Star size={15} />保存</button><button className="primary-button compact" disabled={!text || Boolean(error) || sendingText} onClick={() => void send()}>{sendingText ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}{sendingText ? '发送中' : '发送'}</button></div></div>
         </div>
         <div className={`drop-card ${isDragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={drop} onClick={pickFiles} role="button" tabIndex={0}>
           <input id="quick-file-input" hidden type="file" multiple onChange={(event) => addFiles(Array.from(event.target.files ?? []))} />
@@ -413,7 +468,7 @@ function SettingsPage({ notify }: { notify: (message: string, tone?: Toast['tone
   const clearClipboard = useFlowStore((state) => state.clearClipboard)
   const clearTransfers = useFlowStore((state) => state.clearTransfers)
   const resetDemo = useFlowStore((state) => state.resetDemo)
-  return <div className="content settings-layout"><aside className="settings-nav"><button className="active"><Zap />同步</button><button><Download />文件</button><button><Bell />通知</button><button><Palette />外观</button><button><ShieldCheck />安全与隐私</button></aside><div className="settings-main"><SettingsGroup icon={<Zap />} title="同步设置" text="决定什么内容可以离开这台电脑。"><SettingToggle title="剪贴板监听" text="只读取纯文本变化；关闭时不会读取任何新内容。" checked={settings.clipboardListening} onChange={(value) => update({ clipboardListening: value })} /><SettingToggle title="自动同步" text="默认关闭。开启后，新复制的文本自动发送至默认设备。" checked={settings.autoSync} onChange={(value) => { if (value && !window.confirm('自动同步可能发送密码、验证码或公司敏感信息。确认开启？')) return; update({ autoSync: value, clipboardListening: value || settings.clipboardListening }) }} /><SettingToggle title="接收后自动写入系统剪贴板" text="默认只进入 FlowBridge 历史，由你手动复制。" checked={settings.autoWriteClipboard} onChange={(value) => update({ autoWriteClipboard: value })} /></SettingsGroup><SettingsGroup icon={<Bell />} title="通知" text="通知默认不展示完整正文。"><SettingToggle title="文本通知" text="收到新文本时提醒。" checked={settings.textNotifications} onChange={(value) => update({ textNotifications: value })} /><SettingToggle title="文件通知" text="传输完成或失败时提醒。" checked={settings.fileNotifications} onChange={(value) => update({ fileNotifications: value })} /><SettingToggle title="通知内容预览" text="可能在锁屏上暴露文本摘要，不建议开启。" checked={settings.previewNotifications} onChange={(value) => update({ previewNotifications: value })} /></SettingsGroup><SettingsGroup icon={<Palette />} title="外观" text="保持清晰、克制，也尊重系统偏好。"><div className="theme-picker">{(['system', 'light', 'dark'] as const).map((theme) => <button key={theme} className={settings.theme === theme ? 'active' : ''} onClick={() => update({ theme })}>{theme === 'system' ? <Monitor /> : theme === 'light' ? <Sun /> : <Moon />}<span>{theme === 'system' ? '跟随系统' : theme === 'light' ? '浅色' : '深色'}</span>{settings.theme === theme && <Check />}</button>)}</div><SettingToggle title="减少动态效果" text="关闭流动、呼吸与页面过渡动画。" checked={settings.reduceMotion} onChange={(value) => update({ reduceMotion: value })} /></SettingsGroup><SettingsGroup icon={<ShieldCheck />} title="数据与隐私" text="清理操作不会影响已收藏的 Prompt。"><div className="danger-actions"><button onClick={() => { if (window.confirm('清空未收藏的剪贴板历史？')) { clearClipboard(); notify('剪贴板历史已清理') } }}><Trash2 />清空剪贴板历史</button><button onClick={() => { if (window.confirm('清空全部传输记录？')) { clearTransfers(); notify('传输记录已清理') } }}><Trash2 />清空传输记录</button><button onClick={() => { if (window.confirm('退出并重置演示数据？')) resetDemo() }}><LogOut />退出演示空间</button></div></SettingsGroup></div></div>
+  return <div className="content settings-layout"><aside className="settings-nav"><button className="active"><Zap />同步</button><button><Download />文件</button><button><Bell />通知</button><button><Palette />外观</button><button><ShieldCheck />安全与隐私</button></aside><div className="settings-main"><SettingsGroup icon={<Zap />} title="同步设置" text="决定什么内容可以离开这台电脑。"><SettingToggle title="剪贴板监听" text="只读取纯文本变化；关闭时不会读取任何新内容。" checked={settings.clipboardListening} onChange={(value) => update({ clipboardListening: value })} /><SettingToggle title="自动同步" text="默认关闭。开启后，新复制的文本自动发送至默认设备。" checked={settings.autoSync} onChange={(value) => { if (value && !window.confirm('自动同步可能发送密码、验证码或公司敏感信息。确认开启？')) return; update({ autoSync: value, clipboardListening: value || settings.clipboardListening }) }} /><SettingToggle title="接收后自动写入系统剪贴板" text="默认只进入 FlowBridge 历史，由你手动复制。" checked={settings.autoWriteClipboard} onChange={(value) => update({ autoWriteClipboard: value })} /></SettingsGroup><SettingsGroup icon={<Bell />} title="通知" text="通知默认不展示完整正文。"><SettingToggle title="文本通知" text="收到新文本时提醒。" checked={settings.textNotifications} onChange={(value) => update({ textNotifications: value })} /><SettingToggle title="文件通知" text="传输完成或失败时提醒。" checked={settings.fileNotifications} onChange={(value) => update({ fileNotifications: value })} /><SettingToggle title="通知内容预览" text="可能在锁屏上暴露文本摘要，不建议开启。" checked={settings.previewNotifications} onChange={(value) => update({ previewNotifications: value })} /></SettingsGroup><SettingsGroup icon={<Palette />} title="外观" text="保持清晰、克制，也尊重系统偏好。"><div className="theme-picker">{(['system', 'light', 'dark'] as const).map((theme) => <button key={theme} className={settings.theme === theme ? 'active' : ''} onClick={() => update({ theme })}>{theme === 'system' ? <Monitor /> : theme === 'light' ? <Sun /> : <Moon />}<span>{theme === 'system' ? '跟随系统' : theme === 'light' ? '浅色' : '深色'}</span>{settings.theme === theme && <Check />}</button>)}</div><SettingToggle title="减少动态效果" text="关闭流动、呼吸与页面过渡动画。" checked={settings.reduceMotion} onChange={(value) => update({ reduceMotion: value })} /></SettingsGroup><SettingsGroup icon={<ShieldCheck />} title="数据与隐私" text="清理操作不会影响已收藏的 Prompt。"><div className="danger-actions"><button onClick={() => { if (window.confirm('清空未收藏的剪贴板历史？')) { clearClipboard(); notify('剪贴板历史已清理') } }}><Trash2 />清空剪贴板历史</button><button onClick={() => { if (window.confirm('清空全部传输记录？')) { clearTransfers(); notify('传输记录已清理') } }}><Trash2 />清空传输记录</button><button onClick={() => { if (window.confirm('退出登录并清除这台电脑上的本地状态？')) { void signOutCloud().finally(resetDemo) } }}><LogOut />退出登录</button></div></SettingsGroup></div></div>
 }
 
 function SettingsGroup({ icon, title, text, children }: { icon: ReactNode; title: string; text: string; children: ReactNode }) {

@@ -1,10 +1,11 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { classifyContent, contentHash, createId } from '../lib/domain'
+import { getOrCreateDeviceId, isCloudConfigured } from '../services/supabase'
 import type { Activity, ClipboardItem, Device, Prompt, Settings, Transfer, TransferStatus } from '../types'
 
 const now = Date.now()
-const currentDevice: Device = { id: 'device-current', name: '这台电脑', platform: 'Windows', status: 'online', isCurrent: true, lastSeenAt: new Date(now).toISOString() }
+const currentDevice: Device = { id: getOrCreateDeviceId(), name: '这台电脑', platform: 'Windows', status: 'online', isCurrent: true, lastSeenAt: new Date(now).toISOString() }
 const studioDevice: Device = { id: 'device-studio', name: 'AI 创作工作站', platform: 'Windows', status: 'online', isCurrent: false, lastSeenAt: new Date(now - 48_000).toISOString() }
 const laptopDevice: Device = { id: 'device-laptop', name: '灵感笔记本', platform: 'Windows', status: 'offline', isCurrent: false, lastSeenAt: new Date(now - 7_200_000).toISOString() }
 
@@ -35,6 +36,9 @@ interface FlowState {
   activities: Activity[]
   settings: Settings
   completeOnboarding: (email: string, deviceName: string) => void
+  setCloudDevices: (devices: Device[]) => void
+  setCloudClipboard: (items: ClipboardItem[]) => void
+  recordCloudClipboard: (item: ClipboardItem, incoming: boolean) => void
   selectTarget: (id: string) => void
   renameDevice: (id: string, name: string) => void
   removeDevice: (id: string) => void
@@ -106,12 +110,12 @@ export const useFlowStore = create<FlowState>()(persist((set, get) => ({
   onboarded: false,
   accountEmail: '',
   workspaceName: '我的创作空间',
-  devices: [currentDevice, studioDevice, laptopDevice],
-  selectedTargetId: studioDevice.id,
-  clipboardItems: initialClipboard,
-  transfers: initialTransfers,
-  prompts: initialPrompts,
-  activities: initialActivities,
+  devices: isCloudConfigured ? [currentDevice] : [currentDevice, studioDevice, laptopDevice],
+  selectedTargetId: isCloudConfigured ? '' : studioDevice.id,
+  clipboardItems: isCloudConfigured ? [] : initialClipboard,
+  transfers: isCloudConfigured ? [] : initialTransfers,
+  prompts: isCloudConfigured ? [] : initialPrompts,
+  activities: isCloudConfigured ? [] : initialActivities,
   settings: defaultSettings,
 
   completeOnboarding: (email, deviceName) => set((state) => ({
@@ -119,6 +123,28 @@ export const useFlowStore = create<FlowState>()(persist((set, get) => ({
     accountEmail: email,
     devices: state.devices.map((device) => device.isCurrent ? { ...device, name: deviceName.trim() || '这台电脑' } : device),
   })),
+  setCloudDevices: (devices) => set((state) => {
+    const selectedStillExists = devices.some((device) => device.id === state.selectedTargetId && !device.isCurrent)
+    return {
+      devices,
+      selectedTargetId: selectedStillExists ? state.selectedTargetId : (devices.find((device) => !device.isCurrent)?.id ?? ''),
+    }
+  }),
+  setCloudClipboard: (items) => set({ clipboardItems: items }),
+  recordCloudClipboard: (item, incoming) => set((state) => {
+    if (state.clipboardItems.some((existing) => existing.id === item.id)) return state
+    const peerId = incoming ? item.sourceDeviceId : item.targetDeviceId
+    const peerName = state.devices.find((device) => device.id === peerId)?.name ?? '另一台设备'
+    return {
+      clipboardItems: [item, ...state.clipboardItems],
+      activities: addActivity(state.activities, {
+        type: 'clipboard',
+        title: incoming ? '已收到文本' : '文本已送达',
+        detail: incoming ? `来自 ${peerName}` : `发送至 ${peerName}`,
+        status: 'success',
+      }),
+    }
+  }),
   selectTarget: (id) => set({ selectedTargetId: id }),
   renameDevice: (id, name) => set((state) => ({ devices: state.devices.map((device) => device.id === id ? { ...device, name: name.trim() || device.name } : device) })),
   removeDevice: (id) => set((state) => {
@@ -183,5 +209,15 @@ export const useFlowStore = create<FlowState>()(persist((set, get) => ({
   deletePrompt: (id) => set((state) => ({ prompts: state.prompts.map((prompt) => prompt.id === id ? { ...prompt, deletedAt: new Date().toISOString() } : prompt) })),
   restorePrompt: (id) => set((state) => ({ prompts: state.prompts.map((prompt) => prompt.id === id ? { ...prompt, deletedAt: undefined } : prompt) })),
   updateSettings: (patch) => set((state) => ({ settings: { ...state.settings, ...patch } })),
-  resetDemo: () => set({ onboarded: false, accountEmail: '', devices: [currentDevice, studioDevice, laptopDevice], selectedTargetId: studioDevice.id, clipboardItems: initialClipboard, transfers: initialTransfers, prompts: initialPrompts, activities: initialActivities, settings: defaultSettings }),
-}), { name: 'flowbridge-v0.1', version: 1 }))
+  resetDemo: () => set({
+    onboarded: false,
+    accountEmail: '',
+    devices: isCloudConfigured ? [currentDevice] : [currentDevice, studioDevice, laptopDevice],
+    selectedTargetId: isCloudConfigured ? '' : studioDevice.id,
+    clipboardItems: isCloudConfigured ? [] : initialClipboard,
+    transfers: isCloudConfigured ? [] : initialTransfers,
+    prompts: isCloudConfigured ? [] : initialPrompts,
+    activities: isCloudConfigured ? [] : initialActivities,
+    settings: defaultSettings,
+  }),
+}), { name: 'flowbridge-v0.2', version: 2 }))
