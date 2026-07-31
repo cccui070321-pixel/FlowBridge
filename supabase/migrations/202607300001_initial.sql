@@ -35,8 +35,8 @@ create table public.clipboard_items (
   created_at timestamptz not null default now()
 );
 
-create unique index clipboard_short_window_dedupe
-  on public.clipboard_items(user_id, source_device_id, target_device_id, content_hash, date_trunc('minute', created_at));
+create index clipboard_dedupe_lookup
+  on public.clipboard_items(user_id, source_device_id, target_device_id, content_hash, created_at desc);
 
 create table public.transfers (
   id uuid primary key default gen_random_uuid(),

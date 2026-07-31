@@ -1,6 +1,6 @@
 {
   "name": "flowbridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "FlowBridge - make multiple computers feel like one.",
   "author": "FlowBridge",
@@ -50,9 +50,22 @@
   "build": {
     "appId": "com.flowbridge.desktop",
     "productName": "FlowBridge",
-    "directories": { "output": "release" },
-    "files": ["dist/**/*", "dist-electron/**/*", "package.json"],
-    "win": { "target": "nsis", "artifactName": "FlowBridge-${version}-Setup.${ext}", "icon": "build/icon.png" },
-    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true }
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "artifactName": "FlowBridge-${version}-Setup.${ext}",
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }

@@ -1,4 +1,4 @@
-# FlowBridge V0.1 进度
+# FlowBridge V0.2 进度
 
 ## 开工回执
 
@@ -23,3 +23,7 @@
 - [x] Windows NSIS 安装包生成：111,257,319 字节，SHA256 `8720C10DA7763F015F24EF4AB54F0A931B6667F1AC9BFDCF1B6C4A6175F8FE31`
 - [x] FlowBridge SVG/PNG 品牌图标与确定性生成脚本
 - [x] 初始化 Git、提交并推送到公开 GitHub 仓库
+- [x] Supabase 项目配置、数据库迁移与公开客户端配置
+- [x] 邮箱密码登录、真实设备注册、20 秒心跳与在线状态
+- [x] Realtime 双向文本传输、离线补收与事件确认
+- [x] 联网模式禁用尚未接入的模拟文件成功状态
