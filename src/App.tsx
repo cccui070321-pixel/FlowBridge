@@ -1,484 +1,336 @@
-import { useCallback, useEffect, useRef, useState, type DragEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import {
-  AlertTriangle, ArchiveRestore, ArrowRight, Bell, Check, CheckCircle2, ChevronDown,
-  Clipboard, CloudOff, Copy, Cpu, Download, File, FileText, FolderClock, Heart, History, Laptop, Link2,
-  LoaderCircle, LockKeyhole, LogOut, Menu, Monitor, Moon, MoreHorizontal, Palette, Pause, Play, Plus, RefreshCcw,
-  Search, Send, Settings as SettingsIcon, ShieldCheck, Sparkles, Star, Sun, Trash2, UploadCloud, Wifi, WifiOff, X,
-  Zap,
+  Activity, AlertCircle, Archive, Bell, Check, ChevronDown, Clipboard, Cloud, Copy, Download,
+  File, FileArchive, FileText, FolderOpen, Gauge, HardDrive, Heart, Home, Image, Laptop,
+  LayoutDashboard, LogOut, Menu, Monitor, MoreHorizontal, Palette, Pause, Play, Plus, RefreshCw,
+  Save, Search, Send, Settings as SettingsIcon, Shield, SlidersHorizontal, Sparkles, Trash2,
+  Upload, User, Users, Video, X,
 } from 'lucide-react'
-import { byteLength, classifyContent, contentHash, formatBytes, isSensitiveContent, relativeTime, validateFiles, validateText } from './lib/domain'
-import { isCloudConfigured, sendCloudClipboard, signInWithPassword, signOutCloud, signUpWithPassword, startWorkspaceSync } from './services/supabase'
+import { formatBytes, relativeTime, validateFiles, validateText } from './lib/domain'
+import {
+  adminRevokeDevices, adminSetAccountStatus, adminSetStorageQuota, adminSetUserRole,
+  createFileDownload, deleteCloudStorageItem, getCloudSession, isCloudConfigured, loadAccountSnapshot,
+  loadAdminData, markTransferCompleted, saveCloudStorageItem, sendCloudClipboard, signInWithPassword,
+  signOutCloud, signUpWithPassword, startWorkspaceSync, updateCloudPreferences, updateCloudProfile,
+  uploadCloudFile,
+} from './services/supabase'
 import { useFlowStore } from './store/useFlowStore'
-import type { Activity, Device, Prompt, Transfer } from './types'
+import type { AdminUserSummary, Device, Settings, StorageCategory, Transfer, UserRole } from './types'
 
-type Page = 'dashboard' | 'clipboard' | 'files' | 'prompts' | 'devices' | 'settings'
-type Toast = { id: number; message: string; tone: 'success' | 'warning' | 'error' }
+type Page = 'home' | 'clipboard' | 'files' | 'prompts' | 'storage' | 'devices' | 'profile' | 'settings' | 'admin'
 
-const pageTitles: Record<Page, { title: string; subtitle: string }> = {
-  dashboard: { title: '工作台', subtitle: '从这里继续你的跨设备工作流' },
-  clipboard: { title: '剪贴板', subtitle: '已发送的文本、Prompt 与链接' },
-  files: { title: '文件传输', subtitle: '查看上传、接收与文件有效期' },
-  prompts: { title: 'Prompt Library', subtitle: '把每次灵感沉淀成可复用资产' },
-  devices: { title: '设备管理', subtitle: '可信设备、在线状态与访问权限' },
-  settings: { title: '设置', subtitle: '同步、通知、外观与隐私' },
+const pageMeta: Record<Page, { title: string; subtitle: string }> = {
+  home: { title: '首页', subtitle: '今天的跨设备工作，从这里继续' },
+  clipboard: { title: '剪贴板', subtitle: '跨设备发送、查找并保留重要内容' },
+  files: { title: '文件传输', subtitle: '可恢复上传、进度追踪与完整性校验' },
+  prompts: { title: 'Prompt Library', subtitle: '整理灵感、版本与常用提示词' },
+  storage: { title: '云端存储', subtitle: '查看空间用量与文件保留策略' },
+  devices: { title: '设备', subtitle: '管理已登录的电脑与默认接收端' },
+  profile: { title: '个人主页', subtitle: '你的账号资料与使用概览' },
+  settings: { title: '设置', subtitle: '按你的习惯调整界面、同步与通知' },
+  admin: { title: '管理后台', subtitle: '用户、配额、权限与审计记录' },
+}
+
+const coreNav: Array<{ id: Page; label: string; icon: typeof Home }> = [
+  { id: 'home', label: '首页', icon: Home },
+  { id: 'clipboard', label: '剪贴板', icon: Clipboard },
+  { id: 'files', label: '文件传输', icon: FolderOpen },
+  { id: 'prompts', label: 'Prompt Library', icon: Sparkles },
+  { id: 'storage', label: '云端存储', icon: HardDrive },
+  { id: 'devices', label: '设备', icon: Laptop },
+]
+
+const formatDate = (value: string) => new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value))
+const initials = (value: string) => (value.trim().slice(0, 2) || 'FB').toUpperCase()
+
+function Brand() {
+  return <div className="brand"><span className="brand-mark"><span /></span><strong>FlowBridge</strong><span className="version-chip">v0.3</span></div>
+}
+
+function EmptyState({ icon, title, detail, action }: { icon: ReactNode; title: string; detail: string; action?: ReactNode }) {
+  return <div className="empty-state"><div className="empty-icon">{icon}</div><h3>{title}</h3><p>{detail}</p>{action}</div>
+}
+
+function StatusDot({ online }: { online: boolean }) {
+  return <span className={`status-dot ${online ? 'online' : ''}`} aria-label={online ? '在线' : '离线'} />
+}
+
+function DevicePicker({ devices, value, onChange }: { devices: Device[]; value: string; onChange: (id: string) => void }) {
+  const peers = devices.filter((device) => !device.isCurrent)
+  return <label className="device-picker"><Monitor size={18} /><select value={value} onChange={(event) => onChange(event.target.value)} aria-label="目标设备"><option value="">选择目标设备</option>{peers.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.status === 'online' ? '在线' : '离线'}</option>)}</select><ChevronDown size={16} /></label>
+}
+
+function AuthScreen({ onDone }: { onDone: (email: string, deviceName: string) => void }) {
+  const [mode, setMode] = useState<'sign-in' | 'sign-up'>('sign-in')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [deviceName, setDeviceName] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+
+  useEffect(() => { void window.flowbridge?.getDeviceInfo().then((info) => setDeviceName(info.hostname)) }, [])
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setBusy(true); setMessage('')
+    try {
+      const session = mode === 'sign-in' ? await signInWithPassword(email.trim(), password) : await signUpWithPassword(email.trim(), password)
+      if (!session) setMessage('验证邮件已发送。确认邮箱后回到这里登录即可。')
+      else onDone(email.trim(), deviceName.trim() || '这台电脑')
+    } catch (error) { setMessage(error instanceof Error ? error.message : '操作失败，请稍后重试') }
+    finally { setBusy(false) }
+  }
+  return <main className="auth-shell">
+    <section className="auth-intro"><Brand /><div><span className="eyebrow">FLOW WITHOUT FRICTION</span><h1>两台电脑，<br />像一台一样工作。</h1><p>剪贴板、文件与灵感安全地在设备间流动。v0.3 现在拥有真实文件传输、个人空间和更清晰的界面。</p></div><div className="auth-feature"><Cloud size={20} /><span><strong>端到端工作流</strong><small>私有云存储 · SHA-256 校验 · 权限隔离</small></span></div></section>
+    <section className="auth-panel"><form className="auth-card" onSubmit={submit}><span className="eyebrow">欢迎使用</span><h2>{mode === 'sign-in' ? '登录 FlowBridge' : '创建你的空间'}</h2><p className="muted">在两台 Windows 电脑上登录同一账号即可同步。</p>
+      <label>邮箱<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@example.com" required /></label>
+      <label>密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={6} placeholder="至少 6 位" required /></label>
+      <label>这台设备的名称<input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} placeholder="例如：办公室电脑" maxLength={80} required /></label>
+      {message && <div className="inline-message"><AlertCircle size={17} />{message}</div>}
+      <button className="primary-button wide" disabled={busy}>{busy ? <RefreshCw className="spin" size={18} /> : mode === 'sign-in' ? '登录' : '注册'}</button>
+      <button className="text-button" type="button" onClick={() => { setMode(mode === 'sign-in' ? 'sign-up' : 'sign-in'); setMessage('') }}>{mode === 'sign-in' ? '没有账号？立即注册' : '已有账号？返回登录'}</button>
+    </form></section>
+  </main>
 }
 
 export function App() {
-  const onboarded = useFlowStore((state) => state.onboarded)
-  const settings = useFlowStore((state) => state.settings)
-  const updateTransfer = useFlowStore((state) => state.updateTransfer)
-  const transfers = useFlowStore((state) => state.transfers)
-  const setCloudDevices = useFlowStore((state) => state.setCloudDevices)
-  const setCloudClipboard = useFlowStore((state) => state.setCloudClipboard)
-  const recordCloudClipboard = useFlowStore((state) => state.recordCloudClipboard)
-  const [page, setPage] = useState<Page>('dashboard')
-  const [toasts, setToasts] = useState<Toast[]>([])
-  const runningTransfers = useRef(new Set<string>())
+  const store = useFlowStore()
+  const [page, setPage] = useState<Page>(() => (localStorage.getItem('flowbridge-last-page') as Page) || 'home')
+  const [authReady, setAuthReady] = useState(!isCloudConfigured)
+  const [notice, setNotice] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null)
+  const [query, setQuery] = useState('')
+  const [mobileNav, setMobileNav] = useState(false)
+  const currentDevice = store.devices.find((device) => device.isCurrent)
+  const currentDeviceId = currentDevice?.id
+  const currentDeviceName = currentDevice?.name
+  const {
+    onboarded, completeOnboarding, setCloudStatus, setProfile, setRole, setQuota, setStorageItems,
+    setCloudTransfers, updateSettings, setCloudDevices, setCloudClipboard, recordCloudClipboard,
+    upsertTransfer,
+  } = store
+  const autoWriteClipboard = store.settings.autoWriteClipboard
 
-  const notify = useCallback((message: string, tone: Toast['tone'] = 'success') => {
-    const id = Date.now() + Math.random()
-    setToasts((current) => [...current, { id, message, tone }])
-    window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 3600)
-  }, [])
-
+  const showNotice = useCallback((text: string, type: 'success' | 'error' | 'info' = 'success') => setNotice({ text, type }), [])
+  useEffect(() => { if (!notice) return; const timer = window.setTimeout(() => setNotice(null), 4200); return () => window.clearTimeout(timer) }, [notice])
+  useEffect(() => {
+    if (!isCloudConfigured) return
+    void getCloudSession().then((session) => {
+      if (session && !onboarded) completeOnboarding(session.user.email ?? '', currentDeviceName ?? '这台电脑')
+    }).catch(() => undefined).finally(() => setAuthReady(true))
+  }, [completeOnboarding, currentDeviceName, onboarded])
   useEffect(() => {
     const root = document.documentElement
-    const resolved = settings.theme === 'system'
-      ? (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
-      : settings.theme
-    root.dataset.theme = resolved
-    root.dataset.motion = settings.reduceMotion ? 'reduced' : 'full'
-  }, [settings.theme, settings.reduceMotion])
+    root.dataset.theme = store.settings.theme
+    root.dataset.density = store.settings.density
+    root.dataset.accent = store.settings.accent
+    root.style.setProperty('--font-scale', String(store.settings.fontScale))
+    root.classList.toggle('reduce-motion', store.settings.reduceMotion)
+  }, [store.settings.theme, store.settings.density, store.settings.accent, store.settings.fontScale, store.settings.reduceMotion])
+  useEffect(() => { if (store.settings.rememberLastPage) localStorage.setItem('flowbridge-last-page', page) }, [page, store.settings.rememberLastPage])
 
   useEffect(() => {
-    if (!onboarded || !isCloudConfigured) return
-    const currentDevice = useFlowStore.getState().devices.find((device) => device.isCurrent)
-    if (!currentDevice) return
-    let stopSync: (() => void) | undefined
+    if (!onboarded || !isCloudConfigured || !currentDeviceId) return
+    let stop: undefined | (() => void)
     let cancelled = false
-    void startWorkspaceSync({
-      deviceName: currentDevice.name,
-      onDevices: setCloudDevices,
-      onInitialClipboard: setCloudClipboard,
-      onIncomingClipboard: (item) => {
-        recordCloudClipboard(item, true)
-        const currentSettings = useFlowStore.getState().settings
-        if (currentSettings.autoWriteClipboard) void window.flowbridge?.writeClipboard(item.content)
-        if (currentSettings.textNotifications) notify('收到来自另一台设备的新文本')
-      },
-      onError: (message) => notify(`云端同步异常：${message}`, 'error'),
-    }).then((cleanup) => {
-      if (cancelled) cleanup()
-      else { stopSync = cleanup; notify('云端同步已连接') }
-    }).catch((error) => notify(error instanceof Error ? error.message : '连接云端失败', 'error'))
-    return () => { cancelled = true; stopSync?.() }
-  }, [notify, onboarded, recordCloudClipboard, setCloudClipboard, setCloudDevices])
-
-  useEffect(() => {
-    transfers.filter((transfer) => transfer.status === 'queued').forEach((transfer) => {
-      if (runningTransfers.current.has(transfer.id)) return
-      runningTransfers.current.add(transfer.id)
-      updateTransfer(transfer.id, { status: 'uploading', progress: 4 })
-      let progress = 4
-      const interval = window.setInterval(() => {
-        progress = Math.min(100, progress + Math.max(4, Math.round(Math.random() * 17)))
-        if (progress >= 100) {
-          window.clearInterval(interval)
-          const checksum = `${contentHash(`${transfer.fileName}:${transfer.fileSize}`)}${contentHash(transfer.createdAt)}`
-          updateTransfer(transfer.id, { status: 'completed', progress: 100, checksum })
-          runningTransfers.current.delete(transfer.id)
-        } else updateTransfer(transfer.id, { progress })
-      }, 420)
-    })
-  }, [transfers, updateTransfer])
-
-  if (!onboarded) return <Onboarding notify={notify} />
-
-  return (
-    <div className="app-shell">
-      <Sidebar page={page} onNavigate={setPage} />
-      <main className="main-panel">
-        <Topbar page={page} onNavigate={setPage} />
-        <div className="page-scroll">
-          {page === 'dashboard' && <Dashboard onNavigate={setPage} notify={notify} />}
-          {page === 'clipboard' && <ClipboardPage notify={notify} />}
-          {page === 'files' && <TransfersPage notify={notify} />}
-          {page === 'prompts' && <PromptsPage notify={notify} />}
-          {page === 'devices' && <DevicesPage notify={notify} />}
-          {page === 'settings' && <SettingsPage notify={notify} />}
-        </div>
-      </main>
-      <div className="toast-stack" aria-live="polite">
-        {toasts.map((toast) => <div key={toast.id} className={`toast ${toast.tone}`}><CheckCircle2 size={17} />{toast.message}</div>)}
-      </div>
-    </div>
-  )
-}
-
-function Onboarding({ notify }: { notify: (message: string, tone?: Toast['tone']) => void }) {
-  const complete = useFlowStore((state) => state.completeOnboarding)
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [deviceName, setDeviceName] = useState('这台电脑')
-  const [busy, setBusy] = useState<'login' | 'signup' | null>(null)
-
-  useEffect(() => {
-    void window.flowbridge?.getDeviceInfo().then((info) => setDeviceName(info.hostname)).catch(() => undefined)
-  }, [])
-
-  const handleAuth = async (mode: 'login' | 'signup') => {
-    if (!/^\S+@\S+\.\S+$/.test(email)) return notify('请输入有效邮箱', 'error')
-    if (password.length < 8) return notify('密码至少需要 8 位', 'error')
-    setBusy(mode)
-    try {
-      const session = mode === 'login'
-        ? await signInWithPassword(email, password)
-        : await signUpWithPassword(email, password)
-      if (!session) return notify('验证邮件已发送。请先在邮箱中确认，再回来点击登录', 'warning')
-      complete(email, deviceName)
-      notify(mode === 'login' ? '登录成功，正在连接设备' : '账号已创建，正在连接设备')
-    } catch (error) {
-      notify(error instanceof Error ? error.message : '登录失败', 'error')
-    } finally { setBusy(null) }
-  }
-
-  return (
-    <div className="onboarding">
-      <section className="welcome-visual">
-        <div className="brand brand-large"><BrandMark /><span>FlowBridge</span></div>
-        <div className="welcome-copy">
-          <span className="eyebrow"><Sparkles size={15} /> AI 跨设备工作流助手</span>
-          <h1>让多台电脑，<br /><em>像一台一样工作。</em></h1>
-          <p>Prompt、素材与生成结果自然流动。少一点中转，多一点连续创作。</p>
-        </div>
-        <div className="device-bridge" aria-hidden="true">
-          <div className="bridge-device left"><Monitor /><span>工作电脑</span><i /></div>
-          <div className="bridge-line"><span /><span /><span /></div>
-          <div className="bridge-device right"><Cpu /><span>AI 工作站</span><i /></div>
-        </div>
-        <div className="trust-row"><ShieldCheck size={17} /><span>默认手动发送</span><span>·</span><LockKeyhole size={17} /><span>私有传输</span></div>
-      </section>
-      <section className="onboarding-form-wrap">
-        <div className="onboarding-form">
-          <div className="mobile-brand"><BrandMark />FlowBridge</div>
-          <span className="step-label">开始使用</span>
-          <h2>连接你的工作空间</h2>
-          <p>同一邮箱登录的设备会出现在彼此的设备列表中。</p>
-          <label>邮箱地址<input value={email} onChange={(event) => setEmail(event.target.value)} type="email" placeholder="you@example.com" /></label>
-          <label>登录密码<input value={password} onChange={(event) => setPassword(event.target.value)} type="password" minLength={8} placeholder="至少 8 位；两台电脑使用同一密码" /></label>
-          <label>这台设备的名称<input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} maxLength={40} /></label>
-          <button className="primary-button" onClick={() => void handleAuth('login')} disabled={Boolean(busy) || !isCloudConfigured}>
-            {busy === 'login' ? <LoaderCircle className="spin" size={18} /> : <Send size={18} />}
-            {isCloudConfigured ? '登录并连接设备' : '云端尚未配置'}
-          </button>
-          {isCloudConfigured && <button className="secondary-button demo-button" onClick={() => void handleAuth('signup')} disabled={Boolean(busy)}>{busy === 'signup' ? <LoaderCircle className="spin" size={18} /> : <Plus size={18} />}首次使用，创建同步账号</button>}
-          <div className="divider"><span>或</span></div>
-          <button className="secondary-button demo-button" onClick={() => complete(email, deviceName)}><Zap size={18} />进入可交互演示空间<ArrowRight size={17} /></button>
-          <div className="demo-note"><CloudOff size={16} /><span>演示数据仅保存在本机。配置 <code>.env.local</code> 后可连接 Supabase。</span></div>
-          <p className="legal">继续即表示你了解：FlowBridge 只读取你主动授权的内容，并可随时暂停同步。</p>
-        </div>
-      </section>
-    </div>
-  )
-}
-
-function BrandMark() {
-  return <span className="brand-mark"><span /><span /></span>
-}
-
-const navItems: Array<{ id: Page; label: string; icon: typeof Monitor }> = [
-  { id: 'dashboard', label: '工作台', icon: Monitor },
-  { id: 'clipboard', label: '剪贴板', icon: Clipboard },
-  { id: 'files', label: '文件传输', icon: FolderClock },
-  { id: 'prompts', label: 'Prompt Library', icon: Sparkles },
-]
-
-function Sidebar({ page, onNavigate }: { page: Page; onNavigate: (page: Page) => void }) {
-  const accountEmail = useFlowStore((state) => state.accountEmail)
-  const devices = useFlowStore((state) => state.devices)
-  const online = devices.filter((device) => device.status === 'online').length
-  return (
-    <aside className="sidebar">
-      <div className="brand"><BrandMark /><span>FlowBridge</span><small>BETA</small></div>
-      <div className="workspace-switch"><span className="workspace-avatar">F</span><div><strong>我的创作空间</strong><span>{online} 台设备在线</span></div><ChevronDown size={16} /></div>
-      <nav>
-        <span className="nav-label">工作空间</span>
-        {navItems.map((item) => <button key={item.id} className={page === item.id ? 'active' : ''} onClick={() => onNavigate(item.id)}><item.icon size={18} />{item.label}{item.id === 'files' && <b>1</b>}</button>)}
-        <span className="nav-label nav-label-spaced">管理</span>
-        <button className={page === 'devices' ? 'active' : ''} onClick={() => onNavigate('devices')}><Laptop size={18} />设备管理<span className="online-pill">{online}</span></button>
-        <button className={page === 'settings' ? 'active' : ''} onClick={() => onNavigate('settings')}><SettingsIcon size={18} />设置</button>
-      </nav>
-      <div className="sidebar-foot">
-        <div className="connection-status"><span className={isCloudConfigured ? 'dot online' : 'dot demo'} />{isCloudConfigured ? '云端已连接' : '本地演示模式'}<span>v0.1</span></div>
-        <div className="user-row"><span className="user-avatar">{accountEmail.slice(0, 1).toUpperCase() || 'F'}</span><div><strong>{accountEmail || 'FlowBridge Creator'}</strong><span>个人空间</span></div><MoreHorizontal size={17} /></div>
-      </div>
-    </aside>
-  )
-}
-
-function Topbar({ page, onNavigate }: { page: Page; onNavigate: (page: Page) => void }) {
-  const settings = useFlowStore((state) => state.settings)
-  const updateSettings = useFlowStore((state) => state.updateSettings)
-  const [searchOpen, setSearchOpen] = useState(false)
-  return (
-    <header className="topbar">
-      <button className="icon-button menu-button"><Menu size={19} /></button>
-      <div><h1>{pageTitles[page].title}</h1><p>{pageTitles[page].subtitle}</p></div>
-      <div className="topbar-actions">
-        <div className={`global-search ${searchOpen ? 'open' : ''}`}><Search size={17} /><input placeholder="搜索 Prompt、文件或文本" onFocus={() => setSearchOpen(true)} onBlur={() => setSearchOpen(false)} /><kbd>⌘ K</kbd></div>
-        <button className="icon-button" aria-label="切换主题" onClick={() => updateSettings({ theme: settings.theme === 'dark' ? 'light' : 'dark' })}>{settings.theme === 'dark' ? <Sun size={19} /> : <Moon size={19} />}</button>
-        <button className="icon-button notification-button" aria-label="通知"><Bell size={19} /><i /></button>
-        <button className={`sync-toggle ${settings.syncPaused ? 'paused' : ''}`} onClick={() => updateSettings({ syncPaused: !settings.syncPaused })}>{settings.syncPaused ? <><Play size={16} />恢复同步</> : <><Pause size={16} />暂停同步</>}</button>
-        <button className="avatar-button" onClick={() => onNavigate('settings')}>FC</button>
-      </div>
-    </header>
-  )
-}
-
-function Dashboard({ onNavigate, notify }: { onNavigate: (page: Page) => void; notify: (message: string, tone?: Toast['tone']) => void }) {
-  const devices = useFlowStore((state) => state.devices)
-  const activities = useFlowStore((state) => state.activities)
-  const transfers = useFlowStore((state) => state.transfers)
-  const prompts = useFlowStore((state) => state.prompts)
-  const current = devices.find((device) => device.isCurrent)!
-  const onlineTargets = devices.filter((device) => !device.isCurrent && device.status === 'online')
-  return (
-    <div className="content dashboard-page">
-      <section className="hero-card">
-        <div className="hero-glow" />
-        <div className="hero-copy"><span className="eyebrow"><span className="live-dot" />桥接正常</span><h2>早上好，创作者。</h2><p>{onlineTargets.length ? `${onlineTargets.length} 台设备正等你继续工作。` : '在另一台电脑登录后，即可开始跨设备同步。'}</p></div>
-        <div className="hero-route"><DeviceOrb device={current} /><div className="flow-line"><span className="flow-packet"><Send size={12} /></span></div>{onlineTargets[0] ? <DeviceOrb device={onlineTargets[0]} /> : <button className="add-device-orb" onClick={() => onNavigate('devices')}><Plus /><span>添加设备</span></button>}</div>
-        <div className="hero-stat"><strong>18</strong><span>今日已桥接</span></div>
-      </section>
-      <section className="section-block">
-        <div className="section-title"><div><h3>你的设备</h3><p>选择目标设备，内容会安全地送到那里</p></div><button className="text-button" onClick={() => onNavigate('devices')}>管理设备<ArrowRight size={15} /></button></div>
-        <div className="device-grid">{devices.map((device) => <DeviceCard key={device.id} device={device} notify={notify} />)}<button className="device-card add-card" onClick={() => onNavigate('devices')}><span><Plus /></span><strong>连接新设备</strong><small>在另一台电脑登录同一账号</small></button></div>
-      </section>
-      <QuickSend notify={notify} onOpenFiles={() => onNavigate('files')} />
-      <div className="dashboard-columns">
-        <section className="panel recent-panel">
-          <div className="panel-title"><div><h3>最近活动</h3><p>你的工作流，一目了然</p></div><button className="icon-button"><MoreHorizontal size={18} /></button></div>
-          <div className="activity-list">{activities.slice(0, 5).map((activity) => <ActivityRow key={activity.id} activity={activity} />)}</div>
-          <button className="panel-footer-button" onClick={() => onNavigate('clipboard')}>查看全部活动<ArrowRight size={15} /></button>
-        </section>
-        <section className="panel continuity-panel">
-          <div className="panel-title"><div><h3>继续工作</h3><p>从最近的上下文接着开始</p></div><Sparkles size={19} /></div>
-          <div className="continuity-card"><div className="continuity-icon"><FileText /></div><div><span>最近 Prompt</span><strong>{prompts[0]?.title ?? '还没有 Prompt'}</strong><p>{prompts[0]?.content.slice(0, 62)}…</p></div><button onClick={() => onNavigate('prompts')}><ArrowRight /></button></div>
-          <div className="mini-stats"><div><strong>{prompts.filter((prompt) => !prompt.deletedAt).length}</strong><span>Prompt</span></div><div><strong>{transfers.length}</strong><span>传输</span></div><div><strong>2</strong><span>设备</span></div></div>
-        </section>
-      </div>
-    </div>
-  )
-}
-
-function DeviceOrb({ device }: { device: Device }) {
-  return <div className="device-orb"><span className="orb-icon">{device.isCurrent ? <Laptop /> : <Monitor />}</span><strong>{device.name}</strong><small>{device.isCurrent ? '当前设备' : '在线'}</small></div>
-}
-
-function DeviceCard({ device, notify }: { device: Device; notify: (message: string, tone?: Toast['tone']) => void }) {
-  const selectTarget = useFlowStore((state) => state.selectTarget)
-  const selected = useFlowStore((state) => state.selectedTargetId === device.id)
-  return (
-    <button className={`device-card ${device.isCurrent ? 'current' : ''} ${selected ? 'selected' : ''}`} onClick={() => { if (!device.isCurrent) { selectTarget(device.id); notify(`目标设备已切换为 ${device.name}`) } }}>
-      <div className="device-card-top"><span className="device-icon">{device.isCurrent ? <Laptop size={22} /> : <Monitor size={22} />}</span><span className={`status-badge ${device.status}`}>{device.status === 'online' ? <Wifi size={12} /> : <WifiOff size={12} />}{device.isCurrent ? '当前设备' : device.status === 'online' ? '在线' : '离线'}</span><MoreHorizontal size={17} /></div>
-      <strong>{device.name}</strong><small>Windows 11 · {device.isCurrent ? '正在使用' : relativeTime(device.lastSeenAt)}</small>
-      {!device.isCurrent && <div className="device-actions"><span><Send size={14} />发送内容</span>{selected && <CheckCircle2 size={16} />}</div>}
-    </button>
-  )
-}
-
-function QuickSend({ notify, onOpenFiles }: { notify: (message: string, tone?: Toast['tone']) => void; onOpenFiles: () => void }) {
-  const devices = useFlowStore((state) => state.devices)
-  const selectedTargetId = useFlowStore((state) => state.selectedTargetId)
-  const selectTarget = useFlowStore((state) => state.selectTarget)
-  const sendText = useFlowStore((state) => state.sendText)
-  const recordCloudClipboard = useFlowStore((state) => state.recordCloudClipboard)
-  const savePrompt = useFlowStore((state) => state.savePrompt)
-  const createTransfers = useFlowStore((state) => state.createTransfers)
-  const [text, setText] = useState('')
-  const [sendingText, setSendingText] = useState(false)
-  const [isDragging, setDragging] = useState(false)
-  const target = devices.find((device) => device.id === selectedTargetId)
-  const error = text ? validateText(text) : null
-  const sensitive = text ? isSensitiveContent(text) : false
-
-  const send = async () => {
-    const validation = validateText(text)
-    if (validation) return notify(validation, 'error')
-    if (sensitive && !window.confirm('内容可能包含验证码、密码或密钥。仍要发送吗？')) return
-    if (!target) return notify('请选择目标设备', 'warning')
-    if (isCloudConfigured) {
-      const currentDevice = devices.find((device) => device.isCurrent)
-      if (!currentDevice) return notify('当前设备尚未完成注册', 'error')
-      setSendingText(true)
+    setCloudStatus('connecting')
+    void (async () => {
       try {
-        const item = await sendCloudClipboard({ sourceDeviceId: currentDevice.id, targetDeviceId: target.id, content: text })
-        recordCloudClipboard(item, false)
-        notify(`${item.contentType === 'prompt' ? 'Prompt' : '文本'}已发送至 ${target.name}`)
-        setText('')
+        const snapshot = await loadAccountSnapshot()
+        if (cancelled) return
+        setProfile(snapshot.profile); setRole(snapshot.role); setQuota(snapshot.quota)
+        setStorageItems(snapshot.storageItems); setCloudTransfers(snapshot.transfers)
+        updateSettings(snapshot.settings)
       } catch (error) {
-        notify(error instanceof Error ? error.message : '发送失败', 'error')
-      } finally { setSendingText(false) }
-      return
-    }
-    const result = sendText(text)
-    if (!result.ok) return notify(result.message, 'warning')
-    notify(`${result.item.contentType === 'prompt' ? 'Prompt' : '文本'}已发送至 ${target.name}`)
-    setText('')
-  }
+        showNotice(`新版云端数据尚未就绪：${error instanceof Error ? error.message : '加载失败'}`, 'error')
+      }
+      try {
+        stop = await startWorkspaceSync({
+          deviceName: currentDeviceName ?? '这台电脑',
+          onDevices: setCloudDevices,
+          onInitialClipboard: setCloudClipboard,
+          onIncomingClipboard: (item) => {
+            recordCloudClipboard(item, true)
+            if (autoWriteClipboard) void window.flowbridge?.writeClipboard(item.content)
+          },
+          onTransfers: setCloudTransfers,
+          onIncomingTransfer: (item) => { upsertTransfer(item); showNotice(`收到文件：${item.fileName}`, 'info') },
+          onError: (message) => showNotice(message, 'error'),
+        })
+        if (!cancelled) setCloudStatus('connected')
+      } catch (error) { setCloudStatus('error'); showNotice(error instanceof Error ? error.message : '云端连接失败', 'error') }
+    })()
+    return () => { cancelled = true; stop?.() }
+  }, [autoWriteClipboard, currentDeviceId, currentDeviceName, onboarded, recordCloudClipboard, setCloudClipboard, setCloudDevices, setCloudStatus, setCloudTransfers, setProfile, setQuota, setRole, setStorageItems, showNotice, updateSettings, upsertTransfer])
 
-  const addFiles = (files: Array<{ name: string; size: number; type?: string; path?: string }>) => {
-    const validation = validateFiles(files)
-    if (validation) return notify(validation, 'error')
-    if (isCloudConfigured) return notify('联网版当前先支持真实文本互传；文件上传将在下一阶段接入', 'warning')
-    const created = createTransfers(files)
-    if (!created.length) return notify('同步已暂停或目标设备无效', 'warning')
-    notify(`${created.length} 个文件已开始传输`)
-    onOpenFiles()
-  }
+  if (!authReady) return <div className="boot-screen"><Brand /><RefreshCw className="spin" /></div>
+  if (isCloudConfigured && !store.onboarded) return <AuthScreen onDone={store.completeOnboarding} />
 
-  const pickFiles = async () => {
-    if (window.flowbridge) addFiles(await window.flowbridge.pickFiles())
-    else document.getElementById('quick-file-input')?.click()
-  }
-
-  const drop = (event: DragEvent) => {
-    event.preventDefault(); setDragging(false)
-    addFiles(Array.from(event.dataTransfer.files))
-  }
-
-  return (
-    <section className="section-block quick-section">
-      <div className="section-title"><div><h3>快速发送</h3><p>把正在做的事，自然地带到另一台电脑</p></div><div className="target-select"><span>发送至</span><select value={selectedTargetId} onChange={(event) => selectTarget(event.target.value)}>{devices.filter((device) => !device.isCurrent).map((device) => <option key={device.id} value={device.id}>{device.name}{device.status === 'offline' ? '（离线）' : ''}</option>)}</select></div></div>
-      <div className="quick-grid">
-        <div className="composer-card">
-          <div className="composer-head"><span><Clipboard size={17} />发送文本</span><span>{formatBytes(byteLength(text))} / 1 MB</span></div>
-          <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="粘贴 Prompt、链接或任何要继续使用的文本…" />
-          {sensitive && <div className="inline-warning"><AlertTriangle size={15} />可能包含敏感内容，发送前请确认。</div>}
-          <div className="composer-actions"><div><button className="icon-button" onClick={async () => setText(window.flowbridge ? await window.flowbridge.readClipboard() : await navigator.clipboard.readText())} title="从剪贴板粘贴"><Clipboard size={17} /></button>{classifyContent(text) === 'prompt' && text && <span className="prompt-detected"><Sparkles size={13} />识别为 Prompt</span>}</div><div><button className="secondary-button compact" disabled={!text || Boolean(error) || sendingText} onClick={() => { savePrompt(text); notify('已保存到 Prompt Library') }}><Star size={15} />保存</button><button className="primary-button compact" disabled={!text || Boolean(error) || sendingText} onClick={() => void send()}>{sendingText ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}{sendingText ? '发送中' : '发送'}</button></div></div>
-        </div>
-        <div className={`drop-card ${isDragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={drop} onClick={pickFiles} role="button" tabIndex={0}>
-          <input id="quick-file-input" hidden type="file" multiple onChange={(event) => addFiles(Array.from(event.target.files ?? []))} />
-          <span className="drop-icon"><UploadCloud /></span><strong>拖拽文件到这里</strong><p>或点击选择文件</p><small>单文件最大 500MB · 最多 20 个</small>
-        </div>
+  const navigate = (next: Page) => { setPage(next); setMobileNav(false); setQuery('') }
+  const displayName = store.profile?.displayName || store.accountEmail.split('@')[0] || 'FlowBridge 用户'
+  const nav = coreNav.filter((item) => store.settings.sidebarOrder.includes(item.id)).sort((a, b) => store.settings.sidebarOrder.indexOf(a.id) - store.settings.sidebarOrder.indexOf(b.id))
+  return <div className="app-shell">
+    <aside className={`sidebar ${mobileNav ? 'open' : ''}`}><div className="sidebar-top"><Brand /><button className="icon-button close-mobile" onClick={() => setMobileNav(false)}><X /></button></div>
+      <button className="workspace-switch"><span className="avatar small">{initials(displayName)}</span><span><strong>{store.workspaceName}</strong><small>{store.devices.filter((device) => device.status === 'online').length} 台设备在线</small></span><ChevronDown size={16} /></button>
+      <nav aria-label="主导航"><span className="nav-label">工作空间</span>{nav.map((item) => <button key={item.id} className={page === item.id ? 'active' : ''} onClick={() => navigate(item.id)}><item.icon size={20} /><span>{item.label}</span>{item.id === 'files' && store.transfers.filter((transfer) => transfer.targetDeviceId === currentDevice?.id && transfer.status === 'waiting').length > 0 && <b className="count-badge">{store.transfers.filter((transfer) => transfer.targetDeviceId === currentDevice?.id && transfer.status === 'waiting').length}</b>}</button>)}
+        <span className="nav-label manage">账户</span><button className={page === 'profile' ? 'active' : ''} onClick={() => navigate('profile')}><User size={20} /><span>个人主页</span></button><button className={page === 'settings' ? 'active' : ''} onClick={() => navigate('settings')}><SettingsIcon size={20} /><span>设置</span></button>{store.role !== 'user' && <button className={page === 'admin' ? 'active' : ''} onClick={() => navigate('admin')}><Shield size={20} /><span>管理后台</span></button>}
+      </nav>
+      <div className="sidebar-footer"><div className="cloud-state"><StatusDot online={store.cloudStatus === 'connected' || !isCloudConfigured} /><span>{isCloudConfigured ? ({ idle: '等待连接', connecting: '正在连接', connected: '云端已连接', error: '连接异常' }[store.cloudStatus]) : '本地演示模式'}</span></div><button className="profile-row" onClick={() => navigate('profile')}><span className="avatar">{initials(displayName)}</span><span><strong>{displayName}</strong><small>{store.accountEmail || '本地账号'}</small></span><MoreHorizontal size={18} /></button></div>
+    </aside>
+    {mobileNav && <button className="sidebar-scrim" onClick={() => setMobileNav(false)} aria-label="关闭菜单" />}
+    <main className="main-area"><header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMobileNav(true)}><Menu /></button><div className="page-title"><h1>{pageMeta[page].title}</h1><p>{pageMeta[page].subtitle}</p></div><label className="global-search"><Search size={19} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索当前页面" /><kbd>Ctrl K</kbd></label><button className="icon-button"><Bell size={20} /></button><button className={`sync-button ${store.settings.syncPaused ? 'paused' : ''}`} onClick={() => store.updateSettings({ syncPaused: !store.settings.syncPaused })}>{store.settings.syncPaused ? <><Play size={17} />恢复同步</> : <><Pause size={17} />暂停同步</>}</button></header>
+      <div className="page-content">
+        {page === 'home' && <HomePage query={query} navigate={navigate} showNotice={showNotice} />}
+        {page === 'clipboard' && <ClipboardPage query={query} showNotice={showNotice} />}
+        {page === 'files' && <FilesPage query={query} showNotice={showNotice} />}
+        {page === 'prompts' && <PromptsPage query={query} showNotice={showNotice} />}
+        {page === 'storage' && <StoragePage query={query} showNotice={showNotice} />}
+        {page === 'devices' && <DevicesPage query={query} showNotice={showNotice} />}
+        {page === 'profile' && <ProfilePage showNotice={showNotice} onLogout={async () => { await signOutCloud(); store.resetDemo() }} />}
+        {page === 'settings' && <SettingsPage showNotice={showNotice} />}
+        {page === 'admin' && store.role !== 'user' && <AdminPage query={query} showNotice={showNotice} />}
       </div>
-    </section>
-  )
+    </main>
+    {notice && <div className={`toast ${notice.type}`}>{notice.type === 'success' ? <Check /> : <AlertCircle />}<span>{notice.text}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+  </div>
 }
 
-function ActivityRow({ activity }: { activity: Activity }) {
-  const icon = activity.type === 'clipboard' ? <Clipboard /> : activity.type === 'file' ? <File /> : activity.type === 'prompt' ? <Sparkles /> : <Laptop />
-  return <div className="activity-row"><span className={`activity-icon ${activity.type}`}>{icon}</span><div><strong>{activity.title}</strong><span>{activity.detail}</span></div><span className={`activity-status ${activity.status}`}>{activity.status === 'success' ? '已完成' : activity.status === 'failed' ? '失败' : activity.status === 'pending' ? '进行中' : '动态'}</span><time>{relativeTime(activity.createdAt)}</time></div>
-}
+type Notice = (text: string, type?: 'success' | 'error' | 'info') => void
 
-function ClipboardPage({ notify }: { notify: (message: string, tone?: Toast['tone']) => void }) {
-  const items = useFlowStore((state) => state.clipboardItems)
-  const devices = useFlowStore((state) => state.devices)
-  const toggleFavorite = useFlowStore((state) => state.toggleClipboardFavorite)
-  const deleteItem = useFlowStore((state) => state.deleteClipboard)
-  const savePrompt = useFlowStore((state) => state.savePrompt)
-  const clear = useFlowStore((state) => state.clearClipboard)
-  const [query, setQuery] = useState('')
-  const [filter, setFilter] = useState<'all' | 'text' | 'prompt' | 'url'>('all')
-  const filtered = items.filter((item) => (filter === 'all' || item.contentType === filter) && item.content.toLowerCase().includes(query.toLowerCase()))
-  const deviceName = (id: string) => devices.find((device) => device.id === id)?.name ?? '未知设备'
-  const copy = async (content: string) => { if (window.flowbridge) await window.flowbridge.writeClipboard(content); else await navigator.clipboard.writeText(content); notify('已复制到系统剪贴板') }
-  return (
-    <div className="content page-content">
-      <div className="toolbar"><div className="filter-search"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索剪贴板内容" /></div><div className="segmented">{(['all', 'text', 'prompt', 'url'] as const).map((value) => <button key={value} className={filter === value ? 'active' : ''} onClick={() => setFilter(value)}>{value === 'all' ? '全部' : value === 'text' ? '文本' : value === 'prompt' ? 'Prompt' : '链接'}</button>)}</div><button className="danger-ghost" onClick={() => { if (window.confirm('清空未收藏的剪贴板历史？已收藏内容会保留。')) { clear(); notify('历史已清理') } }}><Trash2 size={16} />清空</button></div>
-      <div className="list-summary"><span>共 {filtered.length} 条记录</span><span><LockKeyhole size={14} />列表只显示摘要，完整内容按需查看</span></div>
-      <div className="clipboard-list">{filtered.map((item) => <article key={item.id} className="clipboard-item"><div className={`type-icon ${item.contentType}`}>{item.contentType === 'url' ? <Link2 /> : item.contentType === 'prompt' ? <Sparkles /> : <Clipboard />}</div><div className="clipboard-body"><div className="item-meta"><span className={`type-label ${item.contentType}`}>{item.contentType === 'prompt' ? 'PROMPT' : item.contentType === 'url' ? 'URL' : '文本'}</span><span>{deviceName(item.sourceDeviceId)} → {deviceName(item.targetDeviceId)}</span><time>{relativeTime(item.createdAt)}</time></div><p>{item.content}</p></div><div className="row-actions"><button className={item.isFavorite ? 'favorite active' : 'favorite'} onClick={() => toggleFavorite(item.id)}><Heart size={17} fill={item.isFavorite ? 'currentColor' : 'none'} /></button>{item.contentType !== 'prompt' && <button onClick={() => { savePrompt(item.content); notify('已保存为 Prompt') }} title="保存为 Prompt"><Sparkles size={17} /></button>}<button onClick={() => void copy(item.content)} title="复制"><Copy size={17} /></button><button onClick={() => deleteItem(item.id)} title="删除"><Trash2 size={17} /></button></div></article>)}</div>
-      {!filtered.length && <EmptyState icon={<Clipboard />} title="没有匹配的内容" text="发送或接收的文本会出现在这里。" />}
-    </div>
-  )
-}
-
-function TransfersPage({ notify }: { notify: (message: string, tone?: Toast['tone']) => void }) {
-  const transfers = useFlowStore((state) => state.transfers)
-  const devices = useFlowStore((state) => state.devices)
-  const createTransfers = useFlowStore((state) => state.createTransfers)
-  const retry = useFlowStore((state) => state.retryTransfer)
-  const cancel = useFlowStore((state) => state.cancelTransfer)
-  const clear = useFlowStore((state) => state.clearTransfers)
-  const [dragging, setDragging] = useState(false)
-  const [filter, setFilter] = useState<'all' | 'active' | 'completed' | 'failed'>('all')
-  const filtered = transfers.filter((transfer) => filter === 'all' || (filter === 'active' ? ['queued', 'uploading', 'waiting'].includes(transfer.status) : transfer.status === filter))
-  const addFiles = (files: Array<{ name: string; size: number; type?: string; path?: string }>) => {
-    const error = validateFiles(files)
-    if (error) return notify(error, 'error')
-    const created = createTransfers(files)
-    if (created.length) notify(`${created.length} 个文件已加入队列`)
-    else notify('请选择有效目标设备并恢复同步', 'warning')
+function QuickSend({ showNotice, compact = false }: { showNotice: Notice; compact?: boolean }) {
+  const { devices, selectedTargetId, selectTarget, sendText, recordCloudClipboard } = useFlowStore()
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const send = async () => {
+    const validation = validateText(text); if (validation) return showNotice(validation, 'error')
+    if (isCloudConfigured) {
+      const source = devices.find((device) => device.isCurrent)
+      if (!source || !selectedTargetId) return showNotice('请选择目标设备', 'error')
+      setBusy(true)
+      try { const item = await sendCloudClipboard({ sourceDeviceId: source.id, targetDeviceId: selectedTargetId, content: text }); recordCloudClipboard(item, false); setText(''); showNotice('已发送到另一台电脑') }
+      catch (error) { showNotice(error instanceof Error ? error.message : '发送失败', 'error') }
+      finally { setBusy(false) }
+    } else {
+      const result = sendText(text); if (!result.ok) return showNotice(result.message, 'error'); setText(''); showNotice('已发送')
+    }
   }
-  const targetName = (id: string) => devices.find((device) => device.id === id)?.name ?? '未知设备'
-  return (
-    <div className="content page-content">
-      <div className={`wide-drop-zone ${dragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); addFiles(Array.from(event.dataTransfer.files)) }} onClick={() => document.getElementById('transfer-file-input')?.click()}><input id="transfer-file-input" hidden multiple type="file" onChange={(event) => addFiles(Array.from(event.target.files ?? []))} /><span><UploadCloud /></span><div><strong>把文件拖到这里，发送到当前目标设备</strong><p>图片、视频、PDF、Office 与设计文件 · 500MB 以内</p></div><button className="secondary-button compact">选择文件</button></div>
-      <div className="toolbar"><div className="segmented">{(['all', 'active', 'completed', 'failed'] as const).map((value) => <button key={value} className={filter === value ? 'active' : ''} onClick={() => setFilter(value)}>{value === 'all' ? '全部' : value === 'active' ? '进行中' : value === 'completed' ? '已完成' : '失败'}</button>)}</div><button className="danger-ghost" onClick={() => { if (window.confirm('清空全部传输记录？这不会删除本地文件。')) clear() }}><Trash2 size={16} />清空记录</button></div>
-      <div className="transfer-table"><div className="table-head"><span>文件</span><span>目标设备</span><span>状态</span><span>大小 / 有效期</span><span /></div>{filtered.map((transfer) => <TransferRow key={transfer.id} transfer={transfer} targetName={targetName(transfer.targetDeviceId)} retry={() => retry(transfer.id)} cancel={() => cancel(transfer.id)} notify={notify} />)}</div>
-      {!filtered.length && <EmptyState icon={<FolderClock />} title="这里还没有传输" text="拖入文件，第一条传输会立即出现在这里。" />}
-    </div>
-  )
+  return <div className={`quick-send ${compact ? 'compact' : ''}`}><div className="quick-send-head"><div><span className="card-kicker">快速发送</span><h2>把内容送到另一台电脑</h2></div><DevicePicker devices={devices} value={selectedTargetId} onChange={selectTarget} /></div><textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="输入文本、链接或 Prompt…" onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') void send() }} /><div className="composer-footer"><span>{text.length.toLocaleString()} 字 · Ctrl + Enter 发送</span><button className="primary-button" onClick={() => void send()} disabled={busy}>{busy ? <RefreshCw className="spin" size={17} /> : <Send size={17} />}发送</button></div></div>
 }
 
-function TransferRow({ transfer, targetName, retry, cancel, notify }: { transfer: Transfer; targetName: string; retry: () => void; cancel: () => void; notify: (message: string, tone?: Toast['tone']) => void }) {
-  const active = ['queued', 'uploading', 'waiting'].includes(transfer.status)
-  const statusLabel: Record<Transfer['status'], string> = { queued: '等待上传', uploading: '上传中', waiting: '等待接收', completed: '已完成', failed: '失败', cancelled: '已取消', expired: '已过期' }
-  return <div className="transfer-row"><div className="file-cell"><span className="file-type-icon"><FileText /></span><div><strong>{transfer.fileName}</strong><span>{transfer.mimeType}</span>{active && <div className="progress"><i style={{ width: `${transfer.progress}%` }} /></div>}</div></div><div className="target-cell"><Monitor size={16} />{targetName}</div><div><span className={`transfer-badge ${transfer.status}`}>{active && <LoaderCircle className="spin" size={13} />}{transfer.status === 'completed' && <Check size={13} />}{statusLabel[transfer.status]}</span>{active && <small className="progress-text">{transfer.progress}%</small>}</div><div className="size-cell"><strong>{formatBytes(transfer.fileSize)}</strong><span>{transfer.status === 'completed' ? `剩余 ${Math.max(0, Math.ceil((new Date(transfer.expiresAt).getTime() - Date.now()) / 86_400_000))} 天` : relativeTime(transfer.createdAt)}</span></div><div className="row-actions">{transfer.status === 'failed' && <button onClick={retry} title="重试"><RefreshCcw size={17} /></button>}{active && <button onClick={cancel} title="取消"><X size={17} /></button>}{transfer.status === 'completed' && <button onClick={() => notify(`校验值：${transfer.checksum}`)} title="查看校验"><ShieldCheck size={17} /></button>}<button><MoreHorizontal size={17} /></button></div></div>
+function HomePage({ navigate, showNotice }: { query: string; navigate: (page: Page) => void; showNotice: Notice }) {
+  const { devices, activities, transfers, quota, settings } = useFlowStore()
+  const recent = activities.slice(0, 5)
+  const percent = Math.min(100, quota.usedBytes / Math.max(quota.quotaBytes, 1) * 100)
+  return <div className="home-grid">{settings.homeWidgets.includes('quick-send') && <section className="span-2"><QuickSend showNotice={showNotice} /></section>}
+    {settings.homeWidgets.includes('devices') && <section className="panel"><div className="panel-heading"><div><span className="card-kicker">设备</span><h2>连接状态</h2></div><button className="link-button" onClick={() => navigate('devices')}>管理</button></div><div className="device-stack">{devices.slice(0, 4).map((device) => <div className="device-line" key={device.id}><span className="device-icon"><Laptop size={20} /></span><span><strong>{device.name}</strong><small>{device.isCurrent ? '当前设备' : relativeTime(device.lastSeenAt)}</small></span><StatusDot online={device.status === 'online'} /></div>)}</div></section>}
+    {settings.homeWidgets.includes('storage') && <section className="panel storage-summary"><div className="panel-heading"><div><span className="card-kicker">云端空间</span><h2>{formatBytes(quota.usedBytes)} / {formatBytes(quota.quotaBytes)}</h2></div><HardDrive /></div><div className="meter"><span style={{ width: `${percent}%` }} /></div><p>还可使用 {formatBytes(Math.max(0, quota.quotaBytes - quota.usedBytes))}</p><button className="secondary-button" onClick={() => navigate('storage')}>查看存储</button></section>}
+    {settings.homeWidgets.includes('recent') && <section className="panel span-2"><div className="panel-heading"><div><span className="card-kicker">最近活动</span><h2>继续上次的工作</h2></div><button className="link-button" onClick={() => navigate('clipboard')}>查看全部</button></div>{recent.length ? <div className="activity-list">{recent.map((item) => <div key={item.id}><span className={`activity-icon ${item.status}`}>{item.type === 'file' ? <File size={18} /> : item.type === 'clipboard' ? <Clipboard size={18} /> : <Activity size={18} />}</span><span><strong>{item.title}</strong><small>{item.detail}</small></span><time>{relativeTime(item.createdAt)}</time></div>)}</div> : <EmptyState icon={<Activity />} title="还没有活动" detail="发送一段文字或一个文件后，这里会出现记录。" />}</section>}
+    <section className="panel"><div className="panel-heading"><div><span className="card-kicker">传输</span><h2>{transfers.filter((item) => ['queued', 'uploading', 'downloading', 'waiting'].includes(item.status)).length} 个进行中</h2></div><Gauge /></div><p className="muted">大文件支持断点续传，完成后自动进行 SHA-256 校验。</p><button className="secondary-button" onClick={() => navigate('files')}>打开文件传输</button></section>
+  </div>
 }
 
-function PromptsPage({ notify }: { notify: (message: string, tone?: Toast['tone']) => void }) {
-  const prompts = useFlowStore((state) => state.prompts)
-  const savePrompt = useFlowStore((state) => state.savePrompt)
-  const toggleFavorite = useFlowStore((state) => state.togglePromptFavorite)
-  const deletePrompt = useFlowStore((state) => state.deletePrompt)
-  const restorePrompt = useFlowStore((state) => state.restorePrompt)
-  const [query, setQuery] = useState('')
-  const [favoritesOnly, setFavoritesOnly] = useState(false)
-  const [showTrash, setShowTrash] = useState(false)
-  const [editorOpen, setEditorOpen] = useState(false)
+function ClipboardPage({ query, showNotice }: { query: string; showNotice: Notice }) {
+  const { clipboardItems, devices, toggleClipboardFavorite, deleteClipboard, clearClipboard, savePrompt } = useFlowStore()
+  const [filter, setFilter] = useState<'all' | 'text' | 'prompt' | 'url' | 'favorite'>('all')
+  const items = clipboardItems.filter((item) => (filter === 'all' || (filter === 'favorite' ? item.isFavorite : item.contentType === filter)) && item.content.toLowerCase().includes(query.toLowerCase()))
+  return <div className="stack"><QuickSend showNotice={showNotice} compact /><div className="toolbar"><div className="segmented">{(['all', 'text', 'prompt', 'url', 'favorite'] as const).map((value) => <button className={filter === value ? 'active' : ''} onClick={() => setFilter(value)} key={value}>{({ all: '全部', text: '文本', prompt: 'Prompt', url: '链接', favorite: '收藏' } as const)[value]}</button>)}</div><button className="danger-link" onClick={() => { if (confirm('清除所有未收藏的剪贴板记录？')) clearClipboard() }}><Trash2 size={17} />清理</button></div>
+    <div className="content-list">{items.map((item) => { const source = devices.find((device) => device.id === item.sourceDeviceId); return <article className="content-card" key={item.id}><div className={`type-icon ${item.contentType}`}>{item.contentType === 'prompt' ? <Sparkles /> : item.contentType === 'url' ? <Cloud /> : <Clipboard />}</div><div className="content-body"><div className="content-meta"><span className="tag">{item.contentType === 'prompt' ? 'PROMPT' : item.contentType === 'url' ? '链接' : '文本'}</span><span>{source?.name ?? '未知设备'} · {formatDate(item.createdAt)}</span></div><p>{item.content}</p></div><div className="card-actions"><button title="收藏" className={item.isFavorite ? 'selected' : ''} onClick={() => toggleClipboardFavorite(item.id)}><Heart size={19} fill={item.isFavorite ? 'currentColor' : 'none'} /></button><button title="复制" onClick={() => { void navigator.clipboard.writeText(item.content); showNotice('已复制') }}><Copy size={19} /></button>{item.contentType === 'prompt' && <button title="存为 Prompt" onClick={() => { savePrompt(item.content); showNotice('已保存到 Prompt Library') }}><Save size={19} /></button>}<button title="删除" onClick={() => deleteClipboard(item.id)}><Trash2 size={19} /></button></div></article> })}{!items.length && <EmptyState icon={<Clipboard />} title="没有找到内容" detail="换一个筛选条件，或者先发送一段文字。" />}</div></div>
+}
+
+function FilesPage({ query, showNotice }: { query: string; showNotice: Notice }) {
+  const store = useFlowStore()
+  const inputRef = useRef<HTMLInputElement>(null)
+  const [dragging, setDragging] = useState(false)
+  const transfers = store.transfers.filter((item) => item.fileName.toLowerCase().includes(query.toLowerCase()))
+  const handleFiles = async (files: File[]) => {
+    const problem = validateFiles(files); if (problem) return showNotice(problem, 'error')
+    const source = store.devices.find((device) => device.isCurrent)
+    if (!source || !store.selectedTargetId) return showNotice('请先选择目标设备', 'error')
+    const optimistic = store.createTransfers(files)
+    for (const [index, file] of files.entries()) {
+      const local = optimistic[index]; if (!local) continue
+      if (!isCloudConfigured) { store.updateTransfer(local.id, { status: 'completed', progress: 100, bytesTransferred: file.size, checksum: '本地演示校验' }); continue }
+      try {
+        store.updateTransfer(local.id, { status: 'uploading', progress: 0 })
+        const result = await uploadCloudFile({ file, transferId: local.id, sourceDeviceId: source.id, targetDeviceId: store.selectedTargetId, onHashProgress: (progress) => store.updateTransfer(local.id, { progress: Math.min(10, Math.round(progress / 10)) }), onProgress: (progress, bytes) => store.updateTransfer(local.id, { status: 'uploading', progress, bytesTransferred: bytes }) })
+        store.upsertTransfer(result.transfer); store.upsertStorageItem(result.storageItem); showNotice(`${file.name} 已上传，等待另一台电脑接收`)
+      } catch (error) { store.updateTransfer(local.id, { status: 'failed', error: error instanceof Error ? error.message : '上传失败' }); showNotice(error instanceof Error ? error.message : '上传失败', 'error') }
+    }
+  }
+  const download = async (item: Transfer) => {
+    if (!item.storageKey) return showNotice('这个文件没有可用的云端地址', 'error')
+    try { store.updateTransfer(item.id, { status: 'downloading' }); const signedUrl = await createFileDownload(item.storageKey); const saved = await window.flowbridge?.downloadFile({ signedUrl, fileName: item.fileName, defaultDirectory: store.settings.downloadDirectory }); if (!saved) return store.updateTransfer(item.id, { status: 'waiting' }); await markTransferCompleted(item.id, item.targetDeviceId, item.sourceDeviceId); store.updateTransfer(item.id, { status: 'completed', progress: 100, bytesTransferred: item.fileSize, localPath: saved }); showNotice('文件已保存并通过传输确认') }
+    catch (error) { store.updateTransfer(item.id, { status: 'failed', error: error instanceof Error ? error.message : '下载失败' }); showNotice(error instanceof Error ? error.message : '下载失败', 'error') }
+  }
+  return <div className="stack"><section className={`drop-zone ${dragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); void handleFiles(Array.from(event.dataTransfer.files)) }}><input ref={inputRef} type="file" multiple hidden onChange={(event) => void handleFiles(Array.from(event.target.files ?? []))} /><span className="drop-icon"><Upload /></span><div><h2>拖放文件到这里</h2><p>单个文件最大 500 MB，支持断点续传与完整性校验。</p></div><DevicePicker devices={store.devices} value={store.selectedTargetId} onChange={store.selectTarget} /><button className="primary-button" onClick={() => inputRef.current?.click()}><Plus size={18} />选择文件</button></section>
+    <section className="panel"><div className="panel-heading"><div><span className="card-kicker">传输记录</span><h2>{transfers.length} 个文件</h2></div><button className="link-button" onClick={store.clearTransfers}>清理已完成</button></div>{transfers.length ? <div className="transfer-list">{transfers.map((item) => <div className="transfer-row" key={item.id}><span className="file-icon"><FileText /></span><div className="transfer-main"><div><strong>{item.fileName}</strong><span>{formatBytes(item.fileSize)} · {formatDate(item.createdAt)}</span></div><div className="progress"><span style={{ width: `${item.progress}%` }} /></div><small>{transferLabel[item.status]}{item.error ? ` · ${item.error}` : ''}</small></div><span className={`status-pill ${item.status}`}>{transferLabel[item.status]}</span>{item.targetDeviceId === store.devices.find((device) => device.isCurrent)?.id && ['waiting', 'uploaded'].includes(item.status) && <button className="secondary-button" onClick={() => void download(item)}><Download size={17} />接收</button>}{item.localPath && <button className="icon-button" onClick={() => void window.flowbridge?.showItemInFolder(item.localPath!)}><FolderOpen size={18} /></button>}{item.status === 'failed' && <button className="icon-button" onClick={() => store.retryTransfer(item.id)}><RefreshCw size={18} /></button>}</div>)}</div> : <EmptyState icon={<FolderOpen />} title="还没有传输记录" detail="选择一个目标设备，然后拖入文件。" />}</section></div>
+}
+
+const transferLabel: Record<Transfer['status'], string> = { queued: '等待上传', uploading: '正在上传', uploaded: '上传完成', waiting: '等待接收', downloading: '正在下载', completed: '已完成', failed: '失败', cancelled: '已取消', expired: '已过期', checksum_failed: '校验失败' }
+
+function PromptsPage({ query, showNotice }: { query: string; showNotice: Notice }) {
+  const { prompts, savePrompt, updatePrompt, togglePromptFavorite, deletePrompt, restorePrompt } = useFlowStore()
+  const [editing, setEditing] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
-  const filtered = prompts.filter((prompt) => Boolean(prompt.deletedAt) === showTrash && (!favoritesOnly || prompt.isFavorite) && `${prompt.title} ${prompt.content} ${prompt.tags.join(' ')}`.toLowerCase().includes(query.toLowerCase()))
-  return (
-    <div className="content page-content">
-      <div className="library-hero"><div><span className="eyebrow"><Sparkles size={14} />PROMPT LIBRARY</span><h2>让好 Prompt 被再次找到。</h2><p>搜索、收藏、创建版本。跨设备发送过的灵感，不再消失在聊天记录里。</p></div><button className="primary-button compact" onClick={() => setEditorOpen(true)}><Plus size={16} />新建 Prompt</button></div>
-      {editorOpen && <div className="inline-editor"><div><strong>新建 Prompt</strong><button className="icon-button" onClick={() => setEditorOpen(false)}><X size={17} /></button></div><textarea autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="输入完整 Prompt…" /><button className="primary-button compact" disabled={!draft.trim()} onClick={() => { savePrompt(draft); setDraft(''); setEditorOpen(false); notify('Prompt 已保存') }}>保存到 Library</button></div>}
-      <div className="toolbar"><div className="filter-search"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、正文或标签" /></div><button className={`filter-button ${favoritesOnly ? 'active' : ''}`} onClick={() => setFavoritesOnly(!favoritesOnly)}><Heart size={16} />只看收藏</button><button className={`filter-button ${showTrash ? 'active' : ''}`} onClick={() => setShowTrash(!showTrash)}><Trash2 size={16} />回收站</button></div>
-      <div className="prompt-grid">{filtered.map((prompt) => <PromptCard key={prompt.id} prompt={prompt} notify={notify} toggleFavorite={() => toggleFavorite(prompt.id)} deletePrompt={() => deletePrompt(prompt.id)} restore={() => restorePrompt(prompt.id)} createVersion={() => { savePrompt(prompt.content, `${prompt.title} · 新版本`, prompt.id); notify('已创建独立新版本') }} />)}</div>
-      {!filtered.length && <EmptyState icon={<Sparkles />} title={showTrash ? '回收站是空的' : '没有匹配的 Prompt'} text="新建一条，或从剪贴板历史保存为 Prompt。" />}
-    </div>
-  )
+  const visible = prompts.filter((prompt) => !prompt.deletedAt && `${prompt.title} ${prompt.content} ${prompt.tags.join(' ')}`.toLowerCase().includes(query.toLowerCase()))
+  return <div className="stack"><div className="toolbar"><div><strong>{visible.length} 个 Prompt</strong><span className="muted"> 收藏、标签与版本会保存在当前设备</span></div><button className="primary-button" onClick={() => { const prompt = savePrompt('', '新 Prompt'); setEditing(prompt.id); setDraft('') }}><Plus size={18} />新建 Prompt</button></div><div className="prompt-grid">{visible.map((prompt) => <article className="prompt-card" key={prompt.id}><div className="prompt-card-head"><span className="spark"><Sparkles /></span><button className={prompt.isFavorite ? 'selected' : ''} onClick={() => togglePromptFavorite(prompt.id)}><Heart fill={prompt.isFavorite ? 'currentColor' : 'none'} /></button></div><input className="title-input" value={prompt.title} onChange={(event) => updatePrompt(prompt.id, { title: event.target.value })} />{editing === prompt.id ? <textarea autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} /> : <p>{prompt.content || '点击编辑，写下你的 Prompt…'}</p>}<div className="tag-row">{prompt.tags.map((tag) => <span className="tag" key={tag}>{tag}</span>)}</div><footer><span>{prompt.modelName || '通用'} · {relativeTime(prompt.updatedAt)}</span><div>{editing === prompt.id ? <button onClick={() => { updatePrompt(prompt.id, { content: draft }); setEditing(null); showNotice('已保存') }}><Check /></button> : <button onClick={() => { setDraft(prompt.content); setEditing(prompt.id) }}><FileText /></button>}<button onClick={() => deletePrompt(prompt.id)}><Trash2 /></button></div></footer></article>)}</div>{!visible.length && <EmptyState icon={<Sparkles />} title="还没有 Prompt" detail="从剪贴板保存一条 Prompt，或创建一条新的。" action={<button className="primary-button" onClick={() => { const item = prompts.find((prompt) => prompt.deletedAt); if (item) restorePrompt(item.id) }}>恢复最近删除</button>} />}</div>
 }
 
-function PromptCard({ prompt, notify, toggleFavorite, deletePrompt, restore, createVersion }: { prompt: Prompt; notify: (message: string, tone?: Toast['tone']) => void; toggleFavorite: () => void; deletePrompt: () => void; restore: () => void; createVersion: () => void }) {
-  const copy = async () => { if (window.flowbridge) await window.flowbridge.writeClipboard(prompt.content); else await navigator.clipboard.writeText(prompt.content); notify('Prompt 已复制') }
-  return <article className="prompt-card"><div className="prompt-card-top"><span className="spark-badge"><Sparkles size={15} /></span><button className={prompt.isFavorite ? 'favorite active' : 'favorite'} onClick={toggleFavorite}><Heart size={17} fill={prompt.isFavorite ? 'currentColor' : 'none'} /></button></div><h3>{prompt.title}</h3><p>{prompt.content}</p><div className="tag-row">{prompt.tags.map((tag) => <span key={tag}>#{tag}</span>)}{prompt.modelName && <span>{prompt.modelName}</span>}</div><div className="prompt-meta"><span>{relativeTime(prompt.updatedAt)}</span>{prompt.parentPromptId && <span><History size={13} />派生版本</span>}</div><div className="prompt-actions">{prompt.deletedAt ? <button onClick={restore}><ArchiveRestore size={16} />恢复</button> : <><button onClick={() => void copy()}><Copy size={16} />复制</button><button onClick={createVersion}><History size={16} />新版本</button><button className="danger" onClick={deletePrompt}><Trash2 size={16} /></button></>}</div></article>
+const categoryIcon: Record<StorageCategory, ReactNode> = { image: <Image />, video: <Video />, document: <FileText />, archive: <FileArchive />, other: <File /> }
+
+function StoragePage({ query, showNotice }: { query: string; showNotice: Notice }) {
+  const { storageItems, quota, setQuota, removeStorageItem, upsertStorageItem } = useFlowStore()
+  const items = storageItems.filter((item) => item.originalName.toLowerCase().includes(query.toLowerCase()))
+  const groups = useMemo(() => Object.entries(items.reduce<Record<string, number>>((sum, item) => ({ ...sum, [item.category]: (sum[item.category] ?? 0) + item.sizeBytes }), {})), [items])
+  const remove = async (item: typeof storageItems[number]) => { if (!confirm(`从云端删除“${item.originalName}”？此操作无法撤销。`)) return; try { await deleteCloudStorageItem(item); removeStorageItem(item.id); setQuota({ ...quota, usedBytes: Math.max(0, quota.usedBytes - item.sizeBytes) }); showNotice('已从云端删除') } catch (error) { showNotice(error instanceof Error ? error.message : '删除失败', 'error') } }
+  const keep = async (item: typeof storageItems[number]) => { try { await saveCloudStorageItem(item.id); upsertStorageItem({ ...item, retentionType: 'saved', expiresAt: undefined }); showNotice('已设为长期保留') } catch (error) { showNotice(error instanceof Error ? error.message : '保存失败', 'error') } }
+  const percentage = Math.min(100, quota.usedBytes / Math.max(quota.quotaBytes, 1) * 100)
+  return <div className="stack"><section className="storage-hero"><div><span className="card-kicker">存储空间</span><h2>{formatBytes(quota.usedBytes)} <small>/ {formatBytes(quota.quotaBytes)}</small></h2><div className="meter large"><span style={{ width: `${percentage}%` }} /></div><p>已使用 {percentage.toFixed(1)}%，剩余 {formatBytes(Math.max(0, quota.quotaBytes - quota.usedBytes))}</p></div><div className="storage-categories">{groups.map(([category, bytes]) => <div key={category}><span>{categoryIcon[category as StorageCategory]}</span><strong>{({ image: '图片', video: '视频', document: '文档', archive: '压缩包', other: '其他' } as Record<string, string>)[category]}</strong><small>{formatBytes(bytes)}</small></div>)}</div></section><section className="panel"><div className="panel-heading"><div><span className="card-kicker">云端文件</span><h2>{items.length} 个项目</h2></div></div>{items.length ? <div className="storage-list">{items.map((item) => <div key={item.id}><span className="file-icon">{categoryIcon[item.category]}</span><span><strong>{item.originalName}</strong><small>{formatBytes(item.sizeBytes)} · {item.retentionType === 'saved' ? '长期保留' : `临时文件${item.expiresAt ? ` · ${relativeTime(item.expiresAt).replace('前', '后过期')}` : ''}`}</small></span><span className="checksum">SHA-256 {item.sha256.slice(0, 10)}…</span>{item.retentionType === 'temporary' && <button className="secondary-button" onClick={() => void keep(item)}><Archive size={17} />保留</button>}<button className="icon-button danger" onClick={() => void remove(item)}><Trash2 size={18} /></button></div>)}</div> : <EmptyState icon={<HardDrive />} title="云端空间是空的" detail="成功发送文件后，它会出现在这里。" />}</section></div>
 }
 
-function DevicesPage({ notify }: { notify: (message: string, tone?: Toast['tone']) => void }) {
-  const devices = useFlowStore((state) => state.devices)
-  const rename = useFlowStore((state) => state.renameDevice)
-  const remove = useFlowStore((state) => state.removeDevice)
-  return <div className="content page-content"><div className="security-banner"><span><ShieldCheck /></span><div><strong>你的可信设备</strong><p>只有同一账号下且未被撤销的设备可以收发内容。移除后访问会立即失效。</p></div><span className="security-score"><Check size={15} />安全状态良好</span></div><div className="device-management-grid">{devices.map((device) => <article key={device.id} className="managed-device"><div className="managed-visual"><span>{device.isCurrent ? <Laptop /> : <Monitor />}</span><i className={device.status} /></div><div><span className={`status-badge ${device.status}`}>{device.isCurrent ? '当前设备' : device.status === 'online' ? '在线' : '离线'}</span><h3>{device.name}</h3><p>Windows 11 · {device.isCurrent ? '本机安全存储' : `最后在线 ${relativeTime(device.lastSeenAt)}`}</p><small>设备 ID · {device.id.slice(-8)}</small></div><div className="managed-actions"><button onClick={() => { const name = window.prompt('新的设备名称', device.name); if (name) { rename(device.id, name); notify('设备名称已更新') } }}>重命名</button>{!device.isCurrent && <button className="danger" onClick={() => { if (window.confirm(`移除 ${device.name}？该设备将无法继续收发内容。`)) { remove(device.id); notify('设备已移除') } }}>移除</button>}</div></article>)}<button className="managed-device connect-device"><span><Plus /></span><h3>连接另一台电脑</h3><p>安装 FlowBridge，并使用同一邮箱登录。</p><button className="secondary-button compact" onClick={() => notify('安装包会在 release 目录生成', 'warning')}>查看安装方式</button></button></div><div className="device-limit"><span>{devices.length} / 5 台设备</span><div><i style={{ width: `${devices.length / 5 * 100}%` }} /></div><small>MVP 默认最多绑定 5 台可信设备</small></div></div>
+function DevicesPage({ query, showNotice }: { query: string; showNotice: Notice }) {
+  const { devices, selectedTargetId, selectTarget, renameDevice, removeDevice, settings, updateSettings } = useFlowStore()
+  const visible = devices.filter((device) => device.name.toLowerCase().includes(query.toLowerCase()))
+  return <div className="device-grid">{visible.map((device) => <article className="device-card" key={device.id}><div className="device-visual"><Monitor /><StatusDot online={device.status === 'online'} /></div><div><div className="device-name"><input value={device.name} onChange={(event) => renameDevice(device.id, event.target.value)} /><span className="tag">{device.isCurrent ? '当前设备' : device.platform}</span></div><p>{device.status === 'online' ? '现在在线' : `上次在线：${relativeTime(device.lastSeenAt)}`}</p></div><div className="device-card-actions">{!device.isCurrent && <label><input type="radio" name="default-device" checked={(settings.defaultTargetDeviceId || selectedTargetId) === device.id} onChange={() => { selectTarget(device.id); updateSettings({ defaultTargetDeviceId: device.id }); if (isCloudConfigured) void updateCloudPreferences({ ...settings, defaultTargetDeviceId: device.id }).catch((error) => showNotice(error.message, 'error')) }} />默认接收设备</label>}{!device.isCurrent && <button className="danger-link" onClick={() => { if (confirm(`移除“${device.name}”？`)) removeDevice(device.id) }}><Trash2 size={17} />移除</button>}</div></article>)}{!visible.length && <EmptyState icon={<Laptop />} title="没有找到设备" detail="在另一台电脑登录同一账号后，它会自动出现。" />}</div>
 }
 
-function SettingsPage({ notify }: { notify: (message: string, tone?: Toast['tone']) => void }) {
-  const settings = useFlowStore((state) => state.settings)
-  const update = useFlowStore((state) => state.updateSettings)
-  const clearClipboard = useFlowStore((state) => state.clearClipboard)
-  const clearTransfers = useFlowStore((state) => state.clearTransfers)
-  const resetDemo = useFlowStore((state) => state.resetDemo)
-  return <div className="content settings-layout"><aside className="settings-nav"><button className="active"><Zap />同步</button><button><Download />文件</button><button><Bell />通知</button><button><Palette />外观</button><button><ShieldCheck />安全与隐私</button></aside><div className="settings-main"><SettingsGroup icon={<Zap />} title="同步设置" text="决定什么内容可以离开这台电脑。"><SettingToggle title="剪贴板监听" text="只读取纯文本变化；关闭时不会读取任何新内容。" checked={settings.clipboardListening} onChange={(value) => update({ clipboardListening: value })} /><SettingToggle title="自动同步" text="默认关闭。开启后，新复制的文本自动发送至默认设备。" checked={settings.autoSync} onChange={(value) => { if (value && !window.confirm('自动同步可能发送密码、验证码或公司敏感信息。确认开启？')) return; update({ autoSync: value, clipboardListening: value || settings.clipboardListening }) }} /><SettingToggle title="接收后自动写入系统剪贴板" text="默认只进入 FlowBridge 历史，由你手动复制。" checked={settings.autoWriteClipboard} onChange={(value) => update({ autoWriteClipboard: value })} /></SettingsGroup><SettingsGroup icon={<Bell />} title="通知" text="通知默认不展示完整正文。"><SettingToggle title="文本通知" text="收到新文本时提醒。" checked={settings.textNotifications} onChange={(value) => update({ textNotifications: value })} /><SettingToggle title="文件通知" text="传输完成或失败时提醒。" checked={settings.fileNotifications} onChange={(value) => update({ fileNotifications: value })} /><SettingToggle title="通知内容预览" text="可能在锁屏上暴露文本摘要，不建议开启。" checked={settings.previewNotifications} onChange={(value) => update({ previewNotifications: value })} /></SettingsGroup><SettingsGroup icon={<Palette />} title="外观" text="保持清晰、克制，也尊重系统偏好。"><div className="theme-picker">{(['system', 'light', 'dark'] as const).map((theme) => <button key={theme} className={settings.theme === theme ? 'active' : ''} onClick={() => update({ theme })}>{theme === 'system' ? <Monitor /> : theme === 'light' ? <Sun /> : <Moon />}<span>{theme === 'system' ? '跟随系统' : theme === 'light' ? '浅色' : '深色'}</span>{settings.theme === theme && <Check />}</button>)}</div><SettingToggle title="减少动态效果" text="关闭流动、呼吸与页面过渡动画。" checked={settings.reduceMotion} onChange={(value) => update({ reduceMotion: value })} /></SettingsGroup><SettingsGroup icon={<ShieldCheck />} title="数据与隐私" text="清理操作不会影响已收藏的 Prompt。"><div className="danger-actions"><button onClick={() => { if (window.confirm('清空未收藏的剪贴板历史？')) { clearClipboard(); notify('剪贴板历史已清理') } }}><Trash2 />清空剪贴板历史</button><button onClick={() => { if (window.confirm('清空全部传输记录？')) { clearTransfers(); notify('传输记录已清理') } }}><Trash2 />清空传输记录</button><button onClick={() => { if (window.confirm('退出登录并清除这台电脑上的本地状态？')) { void signOutCloud().finally(resetDemo) } }}><LogOut />退出登录</button></div></SettingsGroup></div></div>
+function ProfilePage({ showNotice, onLogout }: { showNotice: Notice; onLogout: () => Promise<void> }) {
+  const { profile, accountEmail, devices, clipboardItems, transfers, patchProfile } = useFlowStore()
+  const [draft, setDraft] = useState({ displayName: profile?.displayName ?? accountEmail.split('@')[0], bio: profile?.bio ?? '', locale: profile?.locale ?? 'zh-CN', timezone: profile?.timezone ?? 'Asia/Shanghai' })
+  const save = async () => { try { if (isCloudConfigured) await updateCloudProfile(draft); patchProfile({ ...draft, updatedAt: new Date().toISOString() }); showNotice('个人资料已保存') } catch (error) { showNotice(error instanceof Error ? error.message : '保存失败', 'error') } }
+  return <div className="profile-layout"><section className="profile-card"><div className="avatar xl">{initials(draft.displayName)}</div><h2>{draft.displayName || 'FlowBridge 用户'}</h2><p>{profile?.email || accountEmail}</p><div className="profile-stats"><div><strong>{devices.length}</strong><span>设备</span></div><div><strong>{clipboardItems.length}</strong><span>剪贴板</span></div><div><strong>{transfers.filter((item) => item.status === 'completed').length}</strong><span>已传文件</span></div></div><button className="secondary-button danger-text" onClick={() => void onLogout()}><LogOut size={18} />退出登录</button></section><section className="panel profile-form"><div className="panel-heading"><div><span className="card-kicker">个人资料</span><h2>让这个空间更像你</h2></div></div><div className="form-grid"><label>显示名称<input value={draft.displayName} onChange={(event) => setDraft({ ...draft, displayName: event.target.value })} maxLength={80} /></label><label>语言<select value={draft.locale} onChange={(event) => setDraft({ ...draft, locale: event.target.value })}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label><label className="full">个人简介<textarea value={draft.bio} onChange={(event) => setDraft({ ...draft, bio: event.target.value })} maxLength={280} placeholder="写一句关于你的工作方式…" /></label><label className="full">时区<select value={draft.timezone} onChange={(event) => setDraft({ ...draft, timezone: event.target.value })}><option value="Asia/Shanghai">中国标准时间（上海）</option><option value="Asia/Hong_Kong">香港时间</option><option value="Asia/Tokyo">日本标准时间</option><option value="America/Los_Angeles">太平洋时间</option></select></label></div><button className="primary-button" onClick={() => void save()}><Save size={18} />保存修改</button></section></div>
 }
 
-function SettingsGroup({ icon, title, text, children }: { icon: ReactNode; title: string; text: string; children: ReactNode }) {
-  return <section className="settings-group"><div className="settings-group-head"><span>{icon}</span><div><h3>{title}</h3><p>{text}</p></div></div><div className="settings-options">{children}</div></section>
+function SettingRow({ title, detail, children }: { title: string; detail: string; children: ReactNode }) { return <div className="setting-row"><div><strong>{title}</strong><p>{detail}</p></div><div>{children}</div></div> }
+function Switch({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }) { return <button className={`switch ${checked ? 'on' : ''}`} onClick={() => onChange(!checked)} role="switch" aria-checked={checked}><span /></button> }
+
+function SettingsPage({ showNotice }: { showNotice: Notice }) {
+  const { settings, updateSettings, devices } = useFlowStore()
+  const apply = (patch: Partial<Settings>) => { const next = { ...settings, ...patch }; updateSettings(patch); if (isCloudConfigured) void updateCloudPreferences(next).catch((error) => showNotice(error.message, 'error')) }
+  const moveNav = (id: string, direction: -1 | 1) => {
+    const order = [...settings.sidebarOrder]
+    const index = order.indexOf(id)
+    const target = index + direction
+    if (index < 0 || target < 0 || target >= order.length) return
+    ;[order[index], order[target]] = [order[target], order[index]]
+    apply({ sidebarOrder: order })
+  }
+  return <div className="settings-layout"><section className="settings-section"><div className="settings-heading"><Palette /><div><h2>外观</h2><p>更宽松、更清晰，也可以跟随系统。</p></div></div><SettingRow title="主题" detail="切换浅色、深色或跟随 Windows"><div className="segmented">{(['system', 'light', 'dark'] as const).map((value) => <button key={value} className={settings.theme === value ? 'active' : ''} onClick={() => apply({ theme: value })}>{value === 'system' ? '系统' : value === 'light' ? '浅色' : '深色'}</button>)}</div></SettingRow><SettingRow title="强调色" detail="用于按钮、进度和选中状态"><div className="color-options">{(['blue', 'indigo', 'teal', 'orange', 'rose', 'graphite'] as const).map((color) => <button key={color} className={`${color} ${settings.accent === color ? 'selected' : ''}`} onClick={() => apply({ accent: color })} aria-label={color} />)}</div></SettingRow><SettingRow title="文字大小" detail="正文不会低于可读尺寸"><select value={settings.fontScale} onChange={(event) => apply({ fontScale: Number(event.target.value) as Settings['fontScale'] })}><option value={0.9}>较小</option><option value={1}>标准</option><option value={1.1}>较大</option><option value={1.25}>特大</option></select></SettingRow><SettingRow title="界面密度" detail="舒适模式留出更多呼吸空间"><div className="segmented"><button className={settings.density === 'comfortable' ? 'active' : ''} onClick={() => apply({ density: 'comfortable' })}>舒适</button><button className={settings.density === 'compact' ? 'active' : ''} onClick={() => apply({ density: 'compact' })}>紧凑</button></div></SettingRow><SettingRow title="减少动态效果" detail="关闭非必要的过渡动画"><Switch checked={settings.reduceMotion} onChange={(value) => apply({ reduceMotion: value })} /></SettingRow></section>
+    <section className="settings-section"><div className="settings-heading"><SlidersHorizontal /><div><h2>同步与文件</h2><p>决定内容如何在设备间流动。</p></div></div><SettingRow title="自动写入系统剪贴板" detail="收到文本后直接写入 Windows 剪贴板"><Switch checked={settings.autoWriteClipboard} onChange={(value) => apply({ autoWriteClipboard: value })} /></SettingRow><SettingRow title="默认目标设备" detail="快速发送时优先选择"><select value={settings.defaultTargetDeviceId ?? ''} onChange={(event) => apply({ defaultTargetDeviceId: event.target.value || undefined })}><option value="">每次询问</option>{devices.filter((device) => !device.isCurrent).map((device) => <option value={device.id} key={device.id}>{device.name}</option>)}</select></SettingRow><SettingRow title="下载目录" detail={settings.downloadDirectory || '每次下载时询问'}><button className="secondary-button" onClick={async () => { const directory = await window.flowbridge?.chooseDownloadDirectory(); if (directory) apply({ downloadDirectory: directory }) }}><FolderOpen size={17} />选择</button></SettingRow><SettingRow title="剪贴板保留时间" detail="收藏内容不受影响"><select value={settings.historyDays} onChange={(event) => apply({ historyDays: Number(event.target.value) })}><option value={7}>7 天</option><option value={30}>30 天</option><option value={90}>90 天</option></select></SettingRow></section>
+    <section className="settings-section"><div className="settings-heading"><Bell /><div><h2>通知</h2><p>只保留对工作有帮助的提醒。</p></div></div><SettingRow title="文本到达" detail="另一台设备发来文本时通知"><Switch checked={settings.textNotifications} onChange={(value) => apply({ textNotifications: value })} /></SettingRow><SettingRow title="文件到达" detail="文件可接收或传输失败时通知"><Switch checked={settings.fileNotifications} onChange={(value) => apply({ fileNotifications: value })} /></SettingRow><SettingRow title="设备状态" detail="设备上线或离线时通知"><Switch checked={settings.deviceNotifications} onChange={(value) => apply({ deviceNotifications: value })} /></SettingRow><SettingRow title="通知中显示内容预览" detail="关闭可避免敏感内容出现在桌面"><Switch checked={settings.previewNotifications} onChange={(value) => apply({ previewNotifications: value })} /></SettingRow></section>
+    <section className="settings-section"><div className="settings-heading"><LayoutDashboard /><div><h2>首页与导航</h2><p>选择首页卡片，并调整左侧导航顺序。</p></div></div>{[['quick-send', '快速发送'], ['devices', '设备状态'], ['recent', '最近活动'], ['storage', '存储空间']].map(([id, label]) => <SettingRow key={id} title={label} detail="可随时重新打开"><Switch checked={settings.homeWidgets.includes(id)} onChange={(value) => apply({ homeWidgets: value ? [...settings.homeWidgets, id] : settings.homeWidgets.filter((item) => item !== id) })} /></SettingRow>)}<div className="nav-order"><strong>导航顺序</strong>{settings.sidebarOrder.map((id, index) => { const item = coreNav.find((entry) => entry.id === id); if (!item) return null; return <div key={id}><span><item.icon size={18} />{item.label}</span><span><button className="secondary-button" disabled={index === 0} onClick={() => moveNav(id, -1)}>上移</button><button className="secondary-button" disabled={index === settings.sidebarOrder.length - 1} onClick={() => moveNav(id, 1)}>下移</button></span></div> })}</div></section>
+  </div>
 }
 
-function SettingToggle({ title, text, checked, onChange }: { title: string; text: string; checked: boolean; onChange: (value: boolean) => void }) {
-  return <label className="setting-row"><div><strong>{title}</strong><span>{text}</span></div><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /><i /></label>
+function AdminPage({ query, showNotice }: { query: string; showNotice: Notice }) {
+  const { adminUsers, auditLogs, setAdminUsers, setAuditLogs, role } = useFlowStore()
+  const [tab, setTab] = useState<'users' | 'audit'>('users')
+  const [busy, setBusy] = useState(false)
+  const refresh = useCallback(async () => { setBusy(true); try { const data = await loadAdminData(); setAdminUsers(data.users); setAuditLogs(data.logs) } catch (error) { showNotice(error instanceof Error ? error.message : '加载管理数据失败', 'error') } finally { setBusy(false) } }, [setAdminUsers, setAuditLogs, showNotice])
+  useEffect(() => { void refresh() }, [refresh])
+  const act = async (task: (reason: string) => Promise<void>) => { const reason = prompt('请填写操作原因（会写入审计日志）：'); if (!reason?.trim()) return; try { await task(reason.trim()); await refresh(); showNotice('管理操作已完成') } catch (error) { showNotice(error instanceof Error ? error.message : '操作失败', 'error') } }
+  const users = adminUsers.filter((user) => `${user.email} ${user.displayName}`.toLowerCase().includes(query.toLowerCase()))
+  return <div className="stack"><div className="toolbar"><div className="segmented"><button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}><Users size={17} />用户</button><button className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}><Shield size={17} />审计日志</button></div><button className="secondary-button" onClick={() => void refresh()} disabled={busy}><RefreshCw className={busy ? 'spin' : ''} size={17} />刷新</button></div>{tab === 'users' ? <section className="panel table-panel"><table><thead><tr><th>用户</th><th>状态</th><th>权限</th><th>设备</th><th>存储</th><th>操作</th></tr></thead><tbody>{users.map((user) => <AdminUserRow key={user.userId} user={user} currentRole={role} act={act} />)}</tbody></table></section> : <section className="panel table-panel"><table><thead><tr><th>时间</th><th>操作</th><th>目标用户</th><th>原因</th><th>结果</th></tr></thead><tbody>{auditLogs.filter((log) => `${log.action} ${log.reason}`.toLowerCase().includes(query.toLowerCase())).map((log) => <tr key={log.id}><td>{formatDate(log.createdAt)}</td><td><code>{log.action}</code></td><td>{log.targetUserId?.slice(0, 8) ?? '—'}</td><td>{log.reason || '—'}</td><td><span className={`status-pill ${log.result}`}>{log.result === 'success' ? '成功' : '失败'}</span></td></tr>)}</tbody></table></section>}</div>
 }
 
-function EmptyState({ icon, title, text }: { icon: ReactNode; title: string; text: string }) {
-  return <div className="empty-state"><span>{icon}</span><h3>{title}</h3><p>{text}</p></div>
+function AdminUserRow({ user, currentRole, act }: { user: AdminUserSummary; currentRole: UserRole; act: (task: (reason: string) => Promise<void>) => Promise<void> }) {
+  return <tr><td><div className="table-user"><span className="avatar small">{initials(user.displayName || user.email)}</span><span><strong>{user.displayName || '未设置名称'}</strong><small>{user.email}</small></span></div></td><td><span className={`status-pill ${user.accountStatus}`}>{user.accountStatus === 'active' ? '正常' : user.accountStatus === 'suspended' ? '已停用' : '待删除'}</span></td><td><select value={user.role} disabled={currentRole !== 'super_admin'} onChange={(event) => void act((reason) => adminSetUserRole(user.userId, event.target.value as UserRole, reason))}><option value="user">用户</option><option value="admin">管理员</option><option value="super_admin">超级管理员</option></select></td><td>{user.deviceCount}</td><td><button className="link-button" onClick={() => { const value = prompt('输入新的配额（GB）：', String(Math.round(user.storageQuota / 1024 ** 3))); const gb = Number(value); if (gb > 0) void act((reason) => adminSetStorageQuota(user.userId, gb * 1024 ** 3, reason)) }}>{formatBytes(user.storageUsed)} / {formatBytes(user.storageQuota)}</button></td><td><div className="table-actions"><button className="icon-button" title="撤销所有设备" onClick={() => void act((reason) => adminRevokeDevices(user.userId, reason))}><Laptop size={17} /></button><button className="icon-button danger" title={user.accountStatus === 'active' ? '停用账号' : '恢复账号'} onClick={() => void act((reason) => adminSetAccountStatus(user.userId, user.accountStatus === 'active' ? 'suspended' : 'active', reason))}>{user.accountStatus === 'active' ? <Pause size={17} /> : <Play size={17} />}</button></div></td></tr>
 }

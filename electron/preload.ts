@@ -7,4 +7,6 @@ contextBridge.exposeInMainWorld('flowbridge', {
   writeClipboard: (text: string) => ipcRenderer.invoke('clipboard:write', text),
   pickFiles: () => ipcRenderer.invoke('files:pick'),
   showItemInFolder: (path: string) => ipcRenderer.invoke('files:reveal', path),
+  chooseDownloadDirectory: () => ipcRenderer.invoke('files:choose-download-directory'),
+  downloadFile: (input: { signedUrl: string; fileName: string; defaultDirectory?: string }) => ipcRenderer.invoke('files:download', input),
 })
