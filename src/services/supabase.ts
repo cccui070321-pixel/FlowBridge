@@ -83,8 +83,8 @@ export async function registerDevice(input: { id: string; name: string; platform
     user_id: session.user.id,
     name: input.name,
     platform: input.platform,
-    app_version: '0.3.0',
-    last_app_version: '0.3.0',
+    app_version: '0.3.1',
+    last_app_version: '0.3.1',
     last_seen_at: new Date().toISOString(),
     revoked_at: null,
   })
