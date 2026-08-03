@@ -1,5 +1,6 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, session, shell } from 'electron'
-import { stat } from 'node:fs/promises'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, net, shell } from 'electron'
+import { createHash, randomUUID } from 'node:crypto'
+import { open, rename, rm, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -66,10 +67,10 @@ app.whenReady().then(() => {
     return result.canceled ? null : result.filePaths[0]
   })
   ipcMain.handle('files:download', async (event, input: unknown) => {
-    const value = input as { signedUrl?: unknown; fileName?: unknown; defaultDirectory?: unknown }
-    if (typeof value?.signedUrl !== 'string' || !value.signedUrl.startsWith('https://')) throw new Error('下载地址无效')
+    const value = input as { signedUrls?: unknown; checksum?: unknown; fileName?: unknown; defaultDirectory?: unknown }
+    if (!Array.isArray(value?.signedUrls) || value.signedUrls.length === 0 || value.signedUrls.length > 20 || value.signedUrls.some((url) => typeof url !== 'string' || !url.startsWith('https://'))) throw new Error('下载地址无效')
+    if (value.checksum !== undefined && (typeof value.checksum !== 'string' || !/^[a-f0-9]{64}$/i.test(value.checksum))) throw new Error('文件校验值无效')
     if (typeof value.fileName !== 'string' || !value.fileName.trim()) throw new Error('文件名无效')
-    const signedUrl = value.signedUrl
     const safeName = path.basename(value.fileName).replace(/[<>:"/\\|?*]/g, '_')
     const defaultPath = typeof value.defaultDirectory === 'string' && path.isAbsolute(value.defaultDirectory)
       ? path.join(value.defaultDirectory, safeName)
@@ -77,16 +78,33 @@ app.whenReady().then(() => {
     const owner = BrowserWindow.fromWebContents(event.sender)
     const result = owner ? await dialog.showSaveDialog(owner, { defaultPath }) : await dialog.showSaveDialog({ defaultPath })
     if (result.canceled || !result.filePath) return null
-    return new Promise<string>((resolve, reject) => {
-      const listener = (_downloadEvent: Electron.Event, item: Electron.DownloadItem) => {
-        if (item.getURL() !== signedUrl) return
-        session.defaultSession.removeListener('will-download', listener)
-        item.setSavePath(result.filePath!)
-        item.once('done', (_doneEvent, state) => state === 'completed' ? resolve(result.filePath!) : reject(new Error(`下载${state === 'cancelled' ? '已取消' : '失败'}`)))
+    const temporaryPath = `${result.filePath}.flowbridge-${randomUUID()}.part`
+    const handle = await open(temporaryPath, 'w')
+    const hash = createHash('sha256')
+    try {
+      for (const signedUrl of value.signedUrls as string[]) {
+        const response = await net.fetch(signedUrl)
+        if (!response.ok || !response.body) throw new Error(`下载失败（HTTP ${response.status}）`)
+        const reader = response.body.getReader()
+        while (true) {
+          const { done, value: bytes } = await reader.read()
+          if (done) break
+          const buffer = Buffer.from(bytes)
+          hash.update(buffer)
+          await handle.write(buffer)
+        }
       }
-      session.defaultSession.on('will-download', listener)
-      event.sender.downloadURL(signedUrl)
-    })
+      await handle.close()
+      const digest = hash.digest('hex')
+      if (typeof value.checksum === 'string' && digest !== value.checksum.toLowerCase()) throw new Error('文件完整性校验失败，请重新接收')
+      await rm(result.filePath, { force: true })
+      await rename(temporaryPath, result.filePath)
+      return result.filePath
+    } catch (error) {
+      await handle.close().catch(() => undefined)
+      await rm(temporaryPath, { force: true }).catch(() => undefined)
+      throw error
+    }
   })
   createWindow()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })

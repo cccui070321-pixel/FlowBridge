@@ -9,6 +9,6 @@ interface Window {
     pickFiles: () => Promise<Array<{ name: string; path: string; size: number }>>
     showItemInFolder: (path: string) => Promise<void>
     chooseDownloadDirectory: () => Promise<string | null>
-    downloadFile: (input: { signedUrl: string; fileName: string; defaultDirectory?: string }) => Promise<string | null>
+    downloadFile: (input: { signedUrls: string[]; checksum?: string; fileName: string; defaultDirectory?: string }) => Promise<string | null>
   }
 }

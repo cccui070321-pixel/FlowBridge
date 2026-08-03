@@ -8,5 +8,5 @@ contextBridge.exposeInMainWorld('flowbridge', {
   pickFiles: () => ipcRenderer.invoke('files:pick'),
   showItemInFolder: (path: string) => ipcRenderer.invoke('files:reveal', path),
   chooseDownloadDirectory: () => ipcRenderer.invoke('files:choose-download-directory'),
-  downloadFile: (input: { signedUrl: string; fileName: string; defaultDirectory?: string }) => ipcRenderer.invoke('files:download', input),
+  downloadFile: (input: { signedUrls: string[]; checksum?: string; fileName: string; defaultDirectory?: string }) => ipcRenderer.invoke('files:download', input),
 })

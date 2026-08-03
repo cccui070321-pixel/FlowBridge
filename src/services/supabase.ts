@@ -2,6 +2,15 @@ import { createClient, type RealtimeChannel, type Session, type SupabaseClient }
 import { createSHA256 } from 'hash-wasm'
 import * as tus from 'tus-js-client'
 import { classifyContent, contentHash } from '../lib/domain'
+import {
+  CHUNK_MANIFEST_FORMAT,
+  MAX_STORAGE_OBJECT_BYTES,
+  chunkManifestKey,
+  createChunkDescriptors,
+  isChunkManifestKey,
+  parseChunkManifest,
+  type FileChunkManifest,
+} from '../lib/fileChunks'
 import type {
   AdminUserSummary,
   AuditLog,
@@ -83,8 +92,8 @@ export async function registerDevice(input: { id: string; name: string; platform
     user_id: session.user.id,
     name: input.name,
     platform: input.platform,
-    app_version: '0.3.1',
-    last_app_version: '0.3.1',
+    app_version: '0.3.2',
+    last_app_version: '0.3.2',
     last_seen_at: new Date().toISOString(),
     revoked_at: null,
   })
@@ -311,6 +320,45 @@ export interface UploadFileInput {
   onHashProgress?: (progress: number) => void
 }
 
+const resumableEndpoint = (() => {
+  const endpoint = new URL(url!)
+  const match = endpoint.hostname.match(/^([^.]+)\.supabase\.co$/)
+  if (match) endpoint.hostname = `${match[1]}.storage.supabase.co`
+  endpoint.pathname = '/storage/v1/upload/resumable'
+  return endpoint.toString()
+})()
+
+async function uploadStorageObject(input: {
+  body: Blob
+  objectName: string
+  session: Session
+  onProgress: (uploaded: number) => void
+}) {
+  await new Promise<void>((resolve, reject) => {
+    const upload = new tus.Upload(input.body, {
+      endpoint: resumableEndpoint,
+      retryDelays: [0, 1000, 3000, 5000, 10000],
+      headers: { authorization: `Bearer ${input.session.access_token}`, 'x-upsert': 'true' },
+      uploadDataDuringCreation: true,
+      removeFingerprintOnSuccess: true,
+      chunkSize: 6 * 1024 * 1024,
+      metadata: {
+        bucketName: bucket,
+        objectName: input.objectName,
+        contentType: 'application/octet-stream',
+        cacheControl: '3600',
+      },
+      onError: reject,
+      onProgress: (uploaded) => input.onProgress(uploaded),
+      onSuccess: () => resolve(),
+    })
+    void upload.findPreviousUploads().then((previous) => {
+      if (previous.length) upload.resumeFromPreviousUpload(previous[0])
+      upload.start()
+    }).catch(reject)
+  })
+}
+
 export async function uploadCloudFile(input: UploadFileInput): Promise<{ transfer: Transfer; storageItem: StorageItem }> {
   if (input.file.size > 500 * 1024 ** 2) throw new Error('单个文件不能超过 500 MB')
   const client = requireClient()
@@ -320,7 +368,9 @@ export async function uploadCloudFile(input: UploadFileInput): Promise<{ transfe
   if (Number(quotaRow.used_bytes_cached) + input.file.size > Number(quotaRow.quota_bytes)) throw new Error('云端空间不足，请先清理文件或联系管理员调整配额')
 
   const transferId = input.transferId ?? crypto.randomUUID()
-  const storageKey = `${session.user.id}/${transferId}/${safeFileName(input.file.name)}`
+  const baseStorageKey = `${session.user.id}/${transferId}/${safeFileName(input.file.name)}`
+  const chunkDescriptors = input.file.size > MAX_STORAGE_OBJECT_BYTES ? createChunkDescriptors(baseStorageKey, input.file.size) : []
+  const storageKey = chunkDescriptors.length ? chunkManifestKey(baseStorageKey) : baseStorageKey
   const expiresAt = new Date(Date.now() + 7 * 86_400_000).toISOString()
   const { error: insertError } = await client.from('transfers').insert({
     id: transferId,
@@ -339,29 +389,44 @@ export async function uploadCloudFile(input: UploadFileInput): Promise<{ transfe
 
   try {
     const checksum = await sha256(input.file, input.onHashProgress)
-    await new Promise<void>((resolve, reject) => {
-      const upload = new tus.Upload(input.file, {
-        endpoint: `${url}/storage/v1/upload/resumable`,
-        retryDelays: [0, 1000, 3000, 5000, 10000],
-        headers: { authorization: `Bearer ${session.access_token}`, 'x-upsert': 'true' },
-        uploadDataDuringCreation: true,
-        removeFingerprintOnSuccess: true,
-        chunkSize: 6 * 1024 * 1024,
-        metadata: {
-          bucketName: bucket,
-          objectName: storageKey,
-          contentType: input.file.type || 'application/octet-stream',
-          cacheControl: '3600',
-        },
-        onError: reject,
-        onProgress: (uploaded, total) => input.onProgress(Math.round(uploaded / Math.max(total, 1) * 100), uploaded),
-        onSuccess: () => resolve(),
+    if (chunkDescriptors.length) {
+      let uploadedBefore = 0
+      for (const [index, chunk] of chunkDescriptors.entries()) {
+        const start = index * MAX_STORAGE_OBJECT_BYTES
+        const body = input.file.slice(start, start + chunk.size)
+        await uploadStorageObject({
+          body,
+          objectName: chunk.key,
+          session,
+          onProgress: (uploaded) => {
+            const totalUploaded = uploadedBefore + uploaded
+            input.onProgress(Math.round(totalUploaded / Math.max(input.file.size, 1) * 100), totalUploaded)
+          },
+        })
+        uploadedBefore += chunk.size
+      }
+      const manifest: FileChunkManifest = {
+        format: CHUNK_MANIFEST_FORMAT,
+        fileName: input.file.name,
+        fileSize: input.file.size,
+        mimeType: input.file.type || 'application/octet-stream',
+        checksum,
+        chunks: chunkDescriptors,
+      }
+      const { error: manifestError } = await client.storage.from(bucket).upload(
+        storageKey,
+        new Blob([JSON.stringify(manifest)], { type: 'application/json' }),
+        { contentType: 'application/json', upsert: true },
+      )
+      if (manifestError) throw manifestError
+    } else {
+      await uploadStorageObject({
+        body: input.file,
+        objectName: storageKey,
+        session,
+        onProgress: (uploaded) => input.onProgress(Math.round(uploaded / Math.max(input.file.size, 1) * 100), uploaded),
       })
-      void upload.findPreviousUploads().then((previous) => {
-        if (previous.length) upload.resumeFromPreviousUpload(previous[0])
-        upload.start()
-      }).catch(reject)
-    })
+    }
 
     const { data: transferRow, error: transferError } = await client.from('transfers').update({
       status: 'waiting',
@@ -399,12 +464,27 @@ export async function uploadCloudFile(input: UploadFileInput): Promise<{ transfe
   }
 }
 
-export async function createFileDownload(storageKey: string) {
+export interface FileDownloadPlan {
+  signedUrls: string[]
+  checksum?: string
+}
+
+export async function createFileDownload(storageKey: string): Promise<FileDownloadPlan> {
   const client = requireClient()
   await requireSession()
-  const { data, error } = await client.storage.from(bucket).createSignedUrl(storageKey, 120, { download: true })
+  if (!isChunkManifestKey(storageKey)) {
+    const { data, error } = await client.storage.from(bucket).createSignedUrl(storageKey, 3600, { download: true })
+    if (error) throw error
+    return { signedUrls: [data.signedUrl] }
+  }
+  const { data: manifestBlob, error: manifestError } = await client.storage.from(bucket).download(storageKey)
+  if (manifestError) throw manifestError
+  const manifest = parseChunkManifest(JSON.parse(await manifestBlob.text()))
+  const { data, error } = await client.storage.from(bucket).createSignedUrls(manifest.chunks.map((chunk) => chunk.key), 3600)
   if (error) throw error
-  return data.signedUrl
+  const signedUrls = data.map((item) => item.signedUrl).filter((value): value is string => Boolean(value))
+  if (signedUrls.length !== manifest.chunks.length) throw new Error('无法生成完整的分片下载地址')
+  return { signedUrls, checksum: manifest.checksum }
 }
 
 export async function markTransferCompleted(transferId: string, sourceDeviceId: string, targetDeviceId: string) {
@@ -417,7 +497,17 @@ export async function markTransferCompleted(transferId: string, sourceDeviceId: 
 
 export async function deleteCloudStorageItem(item: StorageItem) {
   const client = requireClient()
-  const { error: storageError } = await client.storage.from(bucket).remove([item.storageKey])
+  let storageKeys = [item.storageKey]
+  if (isChunkManifestKey(item.storageKey)) {
+    const { data } = await client.storage.from(bucket).download(item.storageKey)
+    if (data) {
+      try {
+        const manifest = parseChunkManifest(JSON.parse(await data.text()))
+        storageKeys = [item.storageKey, ...manifest.chunks.map((chunk) => chunk.key)]
+      } catch { /* Remove at least the manifest when it cannot be read. */ }
+    }
+  }
+  const { error: storageError } = await client.storage.from(bucket).remove(storageKeys)
   if (storageError) throw storageError
   const { error } = await client.from('storage_items').update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', item.id)
   if (error) throw error

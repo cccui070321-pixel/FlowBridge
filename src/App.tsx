@@ -44,7 +44,7 @@ const formatDate = (value: string) => new Intl.DateTimeFormat('zh-CN', { month: 
 const initials = (value: string) => (value.trim().slice(0, 2) || 'FB').toUpperCase()
 
 function Brand() {
-  return <div className="brand"><span className="brand-mark"><span /></span><strong>FlowBridge</strong><span className="version-chip">v0.3</span></div>
+  return <div className="brand"><span className="brand-mark"><span /></span><strong>FlowBridge</strong><span className="version-chip">v0.3.2</span></div>
 }
 
 function EmptyState({ icon, title, detail, action }: { icon: ReactNode; title: string; detail: string; action?: ReactNode }) {
@@ -257,7 +257,7 @@ function FilesPage({ query, showNotice }: { query: string; showNotice: Notice })
   }
   const download = async (item: Transfer) => {
     if (!item.storageKey) return showNotice('这个文件没有可用的云端地址', 'error')
-    try { store.updateTransfer(item.id, { status: 'downloading' }); const signedUrl = await createFileDownload(item.storageKey); const saved = await window.flowbridge?.downloadFile({ signedUrl, fileName: item.fileName, defaultDirectory: store.settings.downloadDirectory }); if (!saved) return store.updateTransfer(item.id, { status: 'waiting' }); await markTransferCompleted(item.id, item.targetDeviceId, item.sourceDeviceId); store.updateTransfer(item.id, { status: 'completed', progress: 100, bytesTransferred: item.fileSize, localPath: saved }); showNotice('文件已保存并通过传输确认') }
+    try { store.updateTransfer(item.id, { status: 'downloading' }); const plan = await createFileDownload(item.storageKey); const saved = await window.flowbridge?.downloadFile({ ...plan, checksum: plan.checksum ?? item.checksum, fileName: item.fileName, defaultDirectory: store.settings.downloadDirectory }); if (!saved) return store.updateTransfer(item.id, { status: 'waiting' }); await markTransferCompleted(item.id, item.targetDeviceId, item.sourceDeviceId); store.updateTransfer(item.id, { status: 'completed', progress: 100, bytesTransferred: item.fileSize, localPath: saved }); showNotice('文件已保存并通过传输确认') }
     catch (error) { store.updateTransfer(item.id, { status: 'failed', error: error instanceof Error ? error.message : '下载失败' }); showNotice(error instanceof Error ? error.message : '下载失败', 'error') }
   }
   return <div className="stack"><section className={`drop-zone ${dragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); void handleFiles(Array.from(event.dataTransfer.files)) }}><input ref={inputRef} type="file" multiple hidden onChange={(event) => void handleFiles(Array.from(event.target.files ?? []))} /><span className="drop-icon"><Upload /></span><div><h2>拖放文件到这里</h2><p>单个文件最大 500 MB，支持断点续传与完整性校验。</p></div><DevicePicker devices={store.devices} value={store.selectedTargetId} onChange={store.selectTarget} /><button className="primary-button" onClick={() => inputRef.current?.click()}><Plus size={18} />选择文件</button></section>
