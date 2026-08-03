@@ -92,8 +92,8 @@ export async function registerDevice(input: { id: string; name: string; platform
     user_id: session.user.id,
     name: input.name,
     platform: input.platform,
-    app_version: '0.3.2',
-    last_app_version: '0.3.2',
+    app_version: '0.3.3',
+    last_app_version: '0.3.3',
     last_seen_at: new Date().toISOString(),
     revoked_at: null,
   })
@@ -297,7 +297,10 @@ const categoryFor = (mimeType: string, name: string): StorageCategory => {
   return 'other'
 }
 
-const safeFileName = (name: string) => name.replace(/[\\/:*?"<>|#%]/g, '_').slice(-180) || 'file'
+export const safeStorageFileName = (name: string) => {
+  const extension = name.match(/\.([a-z0-9]{1,16})$/i)?.[1]?.toLowerCase()
+  return `file${extension ? `.${extension}` : ''}`
+}
 
 export async function sha256(file: File, onProgress?: (progress: number) => void) {
   const hasher = await createSHA256()
@@ -368,7 +371,7 @@ export async function uploadCloudFile(input: UploadFileInput): Promise<{ transfe
   if (Number(quotaRow.used_bytes_cached) + input.file.size > Number(quotaRow.quota_bytes)) throw new Error('云端空间不足，请先清理文件或联系管理员调整配额')
 
   const transferId = input.transferId ?? crypto.randomUUID()
-  const baseStorageKey = `${session.user.id}/${transferId}/${safeFileName(input.file.name)}`
+  const baseStorageKey = `${session.user.id}/${transferId}/${safeStorageFileName(input.file.name)}`
   const chunkDescriptors = input.file.size > MAX_STORAGE_OBJECT_BYTES ? createChunkDescriptors(baseStorageKey, input.file.size) : []
   const storageKey = chunkDescriptors.length ? chunkManifestKey(baseStorageKey) : baseStorageKey
   const expiresAt = new Date(Date.now() + 7 * 86_400_000).toISOString()

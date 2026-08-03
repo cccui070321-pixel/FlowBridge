@@ -44,7 +44,7 @@ const formatDate = (value: string) => new Intl.DateTimeFormat('zh-CN', { month: 
 const initials = (value: string) => (value.trim().slice(0, 2) || 'FB').toUpperCase()
 
 function Brand() {
-  return <div className="brand"><span className="brand-mark"><span /></span><strong>FlowBridge</strong><span className="version-chip">v0.3.2</span></div>
+  return <div className="brand"><span className="brand-mark"><span /></span><strong>FlowBridge</strong><span className="version-chip">v0.3.3</span></div>
 }
 
 function EmptyState({ icon, title, detail, action }: { icon: ReactNode; title: string; detail: string; action?: ReactNode }) {
