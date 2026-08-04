@@ -6,12 +6,12 @@ FlowBridge 是面向 AI 创作者的跨设备工作流助手。仓库包含可�
 
 ## 当前版本
 
-V0.4.0「稳定连接」提供两种运行方式：
+V0.4.1「个性化显示修复」提供两种运行方式：
 
 - **演示空间**：完整交互、本地持久化和安全 IPC，用于开发与界面验收。
 - **Supabase 模式**：邮箱登录、自动重连与补拉、双向文本、持久化分片传输队列、后台自动接收、SHA-256 校验、头像与壁纸、程序内更新、存储配额、RBAC 与审计日志。
 
-V0.4.0 保持 `com.flowbridge.desktop` 应用标识以及 `flowbridge-v0.2` 本地数据键。当前用户最后手动安装一次 V0.4.0，后续稳定版本可在程序的“设置 → 软件更新”中完成更新。
+V0.4.1 保持 `com.flowbridge.desktop` 应用标识以及 `flowbridge-v0.2` 本地数据键。已经安装 V0.4.0 的用户可直接在程序的“设置 → 软件更新”中升级，不需要重新下载安装包。
 
 ## 本地运行
 
@@ -67,8 +67,8 @@ Publishable key 可以出现在桌面客户端，真正的安全边界是迁移�
 
 ## 当前边界
 
-- V0.4.0 仍以 Windows 为主；macOS、局域网直连、端到端加密与系统级全局快捷键不在本版范围。
+- V0.4.1 仍以 Windows 为主；macOS、局域网直连、端到端加密与系统级全局快捷键不在本版范围。
 - 文件内容存放在私有 Supabase Storage；客户端只包含 Publishable key，不能包含 Secret 或 `service_role` 密钥。
 - 管理后台默认不可见，需要在数据库中把首个可信账号设为 `super_admin`。
 
-详细产品范围见 [PRD V3.0](docs/FlowBridge_PRD_V3.0.md)，版本变更见 [V0.4.0 发布说明](docs/FlowBridge_v0.4.0_RELEASE_NOTES.md)。
+详细产品范围见 [PRD V3.0](docs/FlowBridge_PRD_V3.0.md)，版本变更见 [V0.4.1 发布说明](docs/FlowBridge_v0.4.1_RELEASE_NOTES.md)。

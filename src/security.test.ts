@@ -10,6 +10,13 @@ describe('renderer content security policy', () => {
     expect(html).not.toMatch(/script-src[^;]*'unsafe-eval'/)
   })
 
+  it('allows private Supabase avatar and wallpaper images to render', () => {
+    const html = readFileSync(resolve(process.cwd(), 'index.html'), 'utf8')
+
+    expect(html).toMatch(/img-src[^;]*https:\/\/\*\.supabase\.co/)
+    expect(html).not.toMatch(/img-src[^;]*https:\/\/(?!\*\.supabase\.co)/)
+  })
+
   it('loads the CommonJS updater through its default export in packaged ESM', () => {
     const mainProcess = readFileSync(resolve(process.cwd(), 'electron/main.ts'), 'utf8')
 
