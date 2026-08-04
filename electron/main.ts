@@ -13,6 +13,9 @@ let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let backgroundRun = true
 let quitting = false
+let updateCheckInFlight = false
+let updateCheckTimeout: ReturnType<typeof setTimeout> | undefined
+const UPDATE_CHECK_TIMEOUT_MS = 30_000
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) {
   quitting = true
@@ -41,17 +44,33 @@ function releaseNotesText(notes: unknown) {
   return undefined
 }
 
-async function requestUpdateCheck() {
+function clearUpdateCheckTimeout() {
+  if (updateCheckTimeout) clearTimeout(updateCheckTimeout)
+  updateCheckTimeout = undefined
+}
+
+function finishUpdateCheck(patch: Partial<UpdateState>) {
+  updateCheckInFlight = false
+  clearUpdateCheckTimeout()
+  broadcastUpdateState(patch)
+}
+
+function requestUpdateCheck() {
   if (!app.isPackaged) {
     broadcastUpdateState({ status: 'unsupported', error: '开发模式不执行自动更新；安装版会正常检查 GitHub Release。' })
     return updateState
   }
-  if (['checking', 'downloading'].includes(updateState.status)) return updateState
-  try {
-    await autoUpdater.checkForUpdates()
-  } catch (error) {
-    broadcastUpdateState({ status: 'error', error: error instanceof Error ? error.message : '检查更新失败' })
-  }
+  if (updateCheckInFlight || updateState.status === 'downloading') return updateState
+  updateCheckInFlight = true
+  broadcastUpdateState({ status: 'checking', percent: undefined, error: undefined })
+  clearUpdateCheckTimeout()
+  updateCheckTimeout = setTimeout(() => {
+    if (!updateCheckInFlight) return
+    finishUpdateCheck({ status: 'error', error: '连接更新服务器超时，请检查网络后重试。' })
+  }, UPDATE_CHECK_TIMEOUT_MS)
+  void autoUpdater.checkForUpdates().catch((error) => {
+    finishUpdateCheck({ status: 'error', error: error instanceof Error ? error.message : '检查更新失败' })
+  })
   return updateState
 }
 
@@ -60,11 +79,11 @@ function setupAutoUpdater() {
   autoUpdater.autoInstallOnAppQuit = true
   autoUpdater.allowPrerelease = false
   autoUpdater.on('checking-for-update', () => broadcastUpdateState({ status: 'checking', percent: undefined, error: undefined }))
-  autoUpdater.on('update-available', (info) => broadcastUpdateState({ status: 'available', version: info.version, releaseNotes: releaseNotesText(info.releaseNotes), error: undefined }))
-  autoUpdater.on('update-not-available', (info) => broadcastUpdateState({ status: 'not-available', version: info.version, percent: undefined, error: undefined }))
+  autoUpdater.on('update-available', (info) => finishUpdateCheck({ status: 'available', version: info.version, releaseNotes: releaseNotesText(info.releaseNotes), error: undefined }))
+  autoUpdater.on('update-not-available', (info) => finishUpdateCheck({ status: 'not-available', version: info.version, percent: undefined, error: undefined }))
   autoUpdater.on('download-progress', (progress) => broadcastUpdateState({ status: 'downloading', percent: Math.round(progress.percent), error: undefined }))
   autoUpdater.on('update-downloaded', (info) => broadcastUpdateState({ status: 'downloaded', version: info.version, percent: 100, releaseNotes: releaseNotesText(info.releaseNotes), error: undefined }))
-  autoUpdater.on('error', (error) => broadcastUpdateState({ status: 'error', error: error.message }))
+  autoUpdater.on('error', (error) => finishUpdateCheck({ status: 'error', error: error.message }))
   setTimeout(() => { void requestUpdateCheck() }, 30_000)
   setInterval(() => { void requestUpdateCheck() }, 6 * 60 * 60 * 1_000)
 }

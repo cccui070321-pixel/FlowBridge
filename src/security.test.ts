@@ -16,4 +16,13 @@ describe('renderer content security policy', () => {
     expect(mainProcess).toContain("import electronUpdater from 'electron-updater'")
     expect(mainProcess).not.toContain("import { autoUpdater } from 'electron-updater'")
   })
+
+  it('returns a visible checking state without waiting indefinitely for GitHub', () => {
+    const mainProcess = readFileSync(resolve(process.cwd(), 'electron/main.ts'), 'utf8')
+
+    expect(mainProcess).toContain("broadcastUpdateState({ status: 'checking'")
+    expect(mainProcess).toContain('UPDATE_CHECK_TIMEOUT_MS = 30_000')
+    expect(mainProcess).toContain("error: '连接更新服务器超时，请检查网络后重试。'")
+    expect(mainProcess).not.toContain('await autoUpdater.checkForUpdates()')
+  })
 })
