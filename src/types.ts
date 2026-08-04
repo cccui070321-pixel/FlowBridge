@@ -1,5 +1,6 @@
 export type DeviceStatus = 'online' | 'offline'
 export type TransferStatus = 'queued' | 'uploading' | 'uploaded' | 'waiting' | 'downloading' | 'completed' | 'failed' | 'cancelled' | 'expired' | 'checksum_failed'
+export type TransferStage = 'queued' | 'hashing' | 'uploading' | 'waiting' | 'downloading' | 'verifying' | 'completed' | 'failed'
 export type ContentType = 'text' | 'prompt' | 'url'
 export type AccentColor = 'blue' | 'indigo' | 'teal' | 'orange' | 'rose' | 'graphite'
 export type InterfaceDensity = 'comfortable' | 'compact'
@@ -14,6 +15,8 @@ export interface Device {
   status: DeviceStatus
   isCurrent: boolean
   lastSeenAt: string
+  clientVersion?: string
+  protocolVersion?: number
 }
 
 export interface ClipboardItem {
@@ -41,6 +44,8 @@ export interface Transfer {
   checksum?: string
   error?: string
   localPath?: string
+  localMtimeMs?: number
+  stage?: TransferStage
   createdAt: string
   expiresAt: string
 }
@@ -75,6 +80,9 @@ export interface Settings {
   syncPaused: boolean
   historyDays: number
   autoDownload: boolean
+  backgroundRun: boolean
+  launchAtStartup: boolean
+  autoUpdate: boolean
   textNotifications: boolean
   fileNotifications: boolean
   deviceNotifications: boolean
@@ -90,6 +98,9 @@ export interface Settings {
   downloadDirectory?: string
   meteredNetworkUploads: boolean
   reduceMotion: boolean
+  wallpaperPath?: string
+  wallpaperUrl?: string
+  wallpaperOverlay: number
 }
 
 export interface UserProfile {
@@ -97,6 +108,7 @@ export interface UserProfile {
   email: string
   displayName: string
   avatarPath?: string
+  avatarUrl?: string
   bio: string
   locale: string
   timezone: string

@@ -9,4 +9,11 @@ describe('renderer content security policy', () => {
     expect(html).toContain("script-src 'self' 'wasm-unsafe-eval'")
     expect(html).not.toMatch(/script-src[^;]*'unsafe-eval'/)
   })
+
+  it('loads the CommonJS updater through its default export in packaged ESM', () => {
+    const mainProcess = readFileSync(resolve(process.cwd(), 'electron/main.ts'), 'utf8')
+
+    expect(mainProcess).toContain("import electronUpdater from 'electron-updater'")
+    expect(mainProcess).not.toContain("import { autoUpdater } from 'electron-updater'")
+  })
 })

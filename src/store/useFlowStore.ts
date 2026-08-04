@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { classifyContent, contentHash, createId } from '../lib/domain'
+import type { CloudConnectionState } from '../lib/reliability'
 import { getOrCreateDeviceId, isCloudConfigured } from '../services/supabase'
 import type {
   Activity,
@@ -51,6 +52,9 @@ export const defaultSettings: Settings = {
   syncPaused: false,
   historyDays: 30,
   autoDownload: false,
+  backgroundRun: true,
+  launchAtStartup: false,
+  autoUpdate: true,
   textNotifications: true,
   fileNotifications: true,
   deviceNotifications: true,
@@ -66,6 +70,9 @@ export const defaultSettings: Settings = {
   downloadDirectory: undefined,
   meteredNetworkUploads: false,
   reduceMotion: false,
+  wallpaperPath: undefined,
+  wallpaperUrl: undefined,
+  wallpaperOverlay: 0.58,
 }
 
 interface FlowState {
@@ -85,7 +92,7 @@ interface FlowState {
   storageItems: StorageItem[]
   adminUsers: AdminUserSummary[]
   auditLogs: AuditLog[]
-  cloudStatus: 'idle' | 'connecting' | 'connected' | 'error'
+  cloudStatus: CloudConnectionState
   completeOnboarding: (email: string, deviceName: string) => void
   setCloudStatus: (status: FlowState['cloudStatus']) => void
   setCloudDevices: (devices: Device[]) => void
@@ -107,10 +114,10 @@ interface FlowState {
   toggleClipboardFavorite: (id: string) => void
   deleteClipboard: (id: string) => void
   clearClipboard: () => void
-  createTransfers: (files: Array<{ name: string; size: number; type?: string; path?: string }>) => Transfer[]
+  createTransfers: (files: Array<{ name: string; size: number; type?: string; path?: string; mtimeMs?: number }>) => Transfer[]
   setCloudTransfers: (items: Transfer[]) => void
   upsertTransfer: (item: Transfer) => void
-  updateTransfer: (id: string, patch: Partial<Pick<Transfer, 'status' | 'progress' | 'bytesTransferred' | 'storageKey' | 'checksum' | 'error' | 'localPath'>>) => void
+  updateTransfer: (id: string, patch: Partial<Pick<Transfer, 'status' | 'progress' | 'bytesTransferred' | 'storageKey' | 'checksum' | 'error' | 'localPath' | 'localMtimeMs' | 'stage'>>) => void
   retryTransfer: (id: string) => void
   cancelTransfer: (id: string) => void
   clearTransfers: () => void
@@ -300,7 +307,9 @@ export const useFlowStore = create<FlowState>()(persist((set, get) => ({
       fileSize: file.size,
       mimeType: file.type || 'application/octet-stream',
       localPath: file.path,
+      localMtimeMs: file.mtimeMs,
       status: 'queued',
+      stage: 'queued',
       progress: 0,
       bytesTransferred: 0,
       createdAt,
@@ -312,7 +321,12 @@ export const useFlowStore = create<FlowState>()(persist((set, get) => ({
     })
     return transfers
   },
-  setCloudTransfers: (transfers) => set({ transfers }),
+  setCloudTransfers: (transfers) => set((state) => ({
+    transfers: transfers.map((transfer) => {
+      const local = state.transfers.find((item) => item.id === transfer.id)
+      return local ? { ...transfer, localPath: local.localPath } : transfer
+    }),
+  })),
   upsertTransfer: (item) => set((state) => ({ transfers: [item, ...state.transfers.filter((entry) => entry.id !== item.id)] })),
   updateTransfer: (id, patch) => set((state) => {
     const transfer = state.transfers.find((item) => item.id === id)
@@ -324,9 +338,9 @@ export const useFlowStore = create<FlowState>()(persist((set, get) => ({
       : state.activities
     return { transfers: state.transfers.map((item) => item.id === id ? { ...item, ...patch } : item), activities }
   }),
-  retryTransfer: (id) => get().updateTransfer(id, { status: 'queued', progress: 0, bytesTransferred: 0, error: undefined }),
+  retryTransfer: (id) => get().updateTransfer(id, { status: 'queued', stage: 'queued', error: undefined }),
   cancelTransfer: (id) => get().updateTransfer(id, { status: 'cancelled' as TransferStatus }),
-  clearTransfers: () => set({ transfers: [] }),
+  clearTransfers: () => set((state) => ({ transfers: state.transfers.filter((item) => !['completed', 'cancelled', 'expired'].includes(item.status)) })),
   savePrompt: (content, title, parentPromptId) => {
     const state = get()
     const prompt: Prompt = {

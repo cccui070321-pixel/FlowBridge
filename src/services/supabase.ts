@@ -11,6 +11,15 @@ import {
   parseChunkManifest,
   type FileChunkManifest,
 } from '../lib/fileChunks'
+import {
+  EventDeliveryGuard,
+  HEARTBEAT_INTERVAL_MS,
+  RECONCILE_INTERVAL_MS,
+  isDeviceOnline,
+  reconnectDelay,
+  type CloudConnectionState,
+} from '../lib/reliability'
+import { APP_VERSION, TRANSFER_PROTOCOL_VERSION } from '../lib/version'
 import type {
   AdminUserSummary,
   AuditLog,
@@ -80,27 +89,57 @@ export async function signUpWithPassword(email: string, password: string) {
 
 export async function signOutCloud() {
   if (!supabase) return
+  const deviceId = window.localStorage.getItem('flowbridge-device-id')
+  if (deviceId) {
+    await supabase.from('devices').update({ revoked_at: new Date().toISOString(), revoked_reason: '用户退出登录' }).eq('id', deviceId).is('revoked_at', null).then(() => undefined)
+  }
   const { error } = await supabase.auth.signOut()
   if (error) throw error
+  window.localStorage.removeItem('flowbridge-device-id')
 }
 
 export async function registerDevice(input: { id: string; name: string; platform: string }) {
   const client = requireClient()
   const session = await requireSession()
-  const { error } = await client.from('devices').upsert({
+  const { data: existing, error: lookupError } = await client.from('devices').select('id,revoked_at').eq('id', input.id).maybeSingle()
+  if (lookupError) throw lookupError
+  if (existing?.revoked_at) throw new Error('这台设备已被移除。请退出登录后重新登录，即可作为新设备重新连接。')
+  const payload = {
     id: input.id,
     user_id: session.user.id,
     name: input.name,
     platform: input.platform,
-    app_version: '0.3.3',
-    last_app_version: '0.3.3',
+    app_version: APP_VERSION,
+    last_app_version: APP_VERSION,
+    protocol_version: TRANSFER_PROTOCOL_VERSION,
+    capabilities: { chunked_files: true, resumable_queue: true, auto_receive: true, background_transfer: true },
     last_seen_at: new Date().toISOString(),
-    revoked_at: null,
-  })
+  }
+  const { error } = existing
+    ? await client.from('devices').update(payload).eq('id', input.id).is('revoked_at', null)
+    : await client.from('devices').insert(payload)
   if (error) throw error
 }
 
-type DeviceRow = { id: string; name: string; platform: Device['platform']; last_seen_at: string; revoked_at: string | null }
+export async function renameCloudDevice(deviceId: string, name: string) {
+  const trimmed = name.trim()
+  if (!trimmed || trimmed.length > 80) throw new Error('设备名称需要 1 到 80 个字符')
+  const client = requireClient()
+  const session = await requireSession()
+  const { error } = await client.from('devices').update({ name: trimmed }).eq('id', deviceId).eq('user_id', session.user.id).is('revoked_at', null)
+  if (error) throw error
+}
+
+export async function revokeCloudDevice(deviceId: string) {
+  const client = requireClient()
+  const session = await requireSession()
+  const { error } = await client.from('devices').update({ revoked_at: new Date().toISOString(), revoked_reason: '由用户从设备管理移除' }).eq('id', deviceId).eq('user_id', session.user.id).is('revoked_at', null)
+  if (error) throw error
+  const { error: preferenceError } = await client.from('user_preferences').update({ default_target_device_id: null, updated_at: new Date().toISOString() }).eq('user_id', session.user.id).eq('default_target_device_id', deviceId)
+  if (preferenceError) throw preferenceError
+}
+
+type DeviceRow = { id: string; name: string; platform: Device['platform']; last_seen_at: string; revoked_at: string | null; app_version?: string | null; last_app_version?: string | null; protocol_version?: number | null }
 type ClipboardRow = {
   id: string; source_device_id: string; target_device_id: string; content: string; content_hash: string
   content_type: ClipboardItem['contentType']; is_favorite: boolean; created_at: string
@@ -121,9 +160,11 @@ const mapDevice = (row: DeviceRow, currentDeviceId: string): Device => ({
   id: row.id,
   name: row.name,
   platform: row.platform,
-  status: row.id === currentDeviceId || Date.now() - new Date(row.last_seen_at).getTime() < 60_000 ? 'online' : 'offline',
+  status: row.id === currentDeviceId || isDeviceOnline(row.last_seen_at) ? 'online' : 'offline',
   isCurrent: row.id === currentDeviceId,
   lastSeenAt: row.last_seen_at,
+  clientVersion: row.last_app_version ?? row.app_version ?? undefined,
+  protocolVersion: row.protocol_version ?? undefined,
 })
 
 const mapClipboard = (row: ClipboardRow): ClipboardItem => ({
@@ -194,6 +235,27 @@ export async function sendCloudClipboard(input: { sourceDeviceId: string; target
   return mapClipboard(data as ClipboardRow)
 }
 
+export async function setCloudClipboardFavorite(itemId: string, isFavorite: boolean) {
+  const client = requireClient()
+  const session = await requireSession()
+  const { error } = await client.from('clipboard_items').update({ is_favorite: isFavorite }).eq('id', itemId).eq('user_id', session.user.id)
+  if (error) throw error
+}
+
+export async function deleteCloudClipboardItem(itemId: string) {
+  const client = requireClient()
+  const session = await requireSession()
+  const { error } = await client.from('clipboard_items').delete().eq('id', itemId).eq('user_id', session.user.id)
+  if (error) throw error
+}
+
+export async function clearCloudClipboard() {
+  const client = requireClient()
+  const session = await requireSession()
+  const { error } = await client.from('clipboard_items').delete().eq('user_id', session.user.id).eq('is_favorite', false)
+  if (error) throw error
+}
+
 export interface AccountSnapshot {
   profile: UserProfile
   settings: Partial<Settings>
@@ -219,12 +281,17 @@ export async function loadAccountSnapshot(): Promise<AccountSnapshot> {
   if (firstError) throw firstError
   const profile = profileResult.data
   const preferences = preferencesResult.data
+  const [avatarResult, wallpaperResult] = await Promise.all([
+    profile.avatar_path ? client.storage.from(bucket).createSignedUrl(profile.avatar_path, 86_400) : Promise.resolve({ data: null, error: null }),
+    preferences.wallpaper_path ? client.storage.from(bucket).createSignedUrl(preferences.wallpaper_path, 86_400) : Promise.resolve({ data: null, error: null }),
+  ])
   return {
     profile: {
       id: userId,
       email: profile.email || session.user.email || '',
       displayName: profile.display_name || session.user.email?.split('@')[0] || 'FlowBridge 用户',
       avatarPath: profile.avatar_path ?? undefined,
+      avatarUrl: avatarResult.data?.signedUrl,
       bio: profile.bio || '',
       locale: profile.locale || 'zh-CN',
       timezone: profile.timezone || 'Asia/Shanghai',
@@ -244,6 +311,13 @@ export async function loadAccountSnapshot(): Promise<AccountSnapshot> {
       deviceNotifications: preferences.notification_policy?.device ?? true,
       previewNotifications: preferences.notification_policy?.preview ?? false,
       historyDays: preferences.retention_policy?.clipboardDays ?? 30,
+      autoDownload: preferences.auto_receive_files ?? false,
+      backgroundRun: preferences.background_run ?? true,
+      launchAtStartup: preferences.launch_at_startup ?? false,
+      autoUpdate: preferences.auto_update ?? true,
+      wallpaperPath: preferences.wallpaper_path ?? undefined,
+      wallpaperUrl: wallpaperResult.data?.signedUrl,
+      wallpaperOverlay: Number(preferences.wallpaper_overlay ?? 0.58),
     },
     role: (roleResult.data?.role ?? 'user') as UserRole,
     quota: { quotaBytes: Number(quotaResult.data?.quota_bytes ?? 2 * 1024 ** 3), usedBytes: Number(quotaResult.data?.used_bytes_cached ?? 0) },
@@ -265,6 +339,37 @@ export async function updateCloudProfile(patch: Pick<UserProfile, 'displayName' 
   if (error) throw error
 }
 
+export async function uploadProfileAsset(kind: 'avatar' | 'wallpaper', blob: Blob, previousPath?: string) {
+  const client = requireClient()
+  const session = await requireSession()
+  const storageKey = `${session.user.id}/profile/${kind}/${crypto.randomUUID()}.webp`
+  const { error: uploadError } = await client.storage.from(bucket).upload(storageKey, blob, { contentType: 'image/webp', upsert: false })
+  if (uploadError) throw uploadError
+  const mutation = kind === 'avatar'
+    ? client.from('profiles').update({ avatar_path: storageKey, updated_at: new Date().toISOString() }).eq('id', session.user.id)
+    : client.from('user_preferences').update({ wallpaper_path: storageKey, updated_at: new Date().toISOString() }).eq('user_id', session.user.id)
+  const { error: updateError } = await mutation
+  if (updateError) {
+    await client.storage.from(bucket).remove([storageKey])
+    throw updateError
+  }
+  if (previousPath && previousPath !== storageKey) await client.storage.from(bucket).remove([previousPath]).catch(() => undefined)
+  const { data, error: urlError } = await client.storage.from(bucket).createSignedUrl(storageKey, 86_400)
+  if (urlError) throw urlError
+  return { path: storageKey, url: data.signedUrl }
+}
+
+export async function resetProfileAsset(kind: 'avatar' | 'wallpaper', previousPath?: string) {
+  const client = requireClient()
+  const session = await requireSession()
+  const mutation = kind === 'avatar'
+    ? client.from('profiles').update({ avatar_path: null, updated_at: new Date().toISOString() }).eq('id', session.user.id)
+    : client.from('user_preferences').update({ wallpaper_path: null, updated_at: new Date().toISOString() }).eq('user_id', session.user.id)
+  const { error } = await mutation
+  if (error) throw error
+  if (previousPath) await client.storage.from(bucket).remove([previousPath]).catch(() => undefined)
+}
+
 export async function updateCloudPreferences(settings: Settings) {
   const client = requireClient()
   const session = await requireSession()
@@ -284,6 +389,12 @@ export async function updateCloudPreferences(settings: Settings) {
       quota: true,
     },
     retention_policy: { clipboardDays: settings.historyDays, transferDays: 7, trashDays: 30 },
+    wallpaper_path: settings.wallpaperPath ?? null,
+    wallpaper_overlay: settings.wallpaperOverlay,
+    auto_receive_files: settings.autoDownload,
+    background_run: settings.backgroundRun,
+    launch_at_startup: settings.launchAtStartup,
+    auto_update: settings.autoUpdate,
     updated_at: new Date().toISOString(),
   }).eq('user_id', session.user.id)
   if (error) throw error
@@ -321,6 +432,21 @@ export interface UploadFileInput {
   targetDeviceId: string
   onProgress: (progress: number, bytesUploaded: number) => void
   onHashProgress?: (progress: number) => void
+}
+
+export interface NativeUploadFile {
+  name: string
+  path: string
+  size: number
+  mtimeMs: number
+  type: string
+}
+
+export interface UploadNativeFileInput {
+  file: NativeUploadFile
+  transferId?: string
+  sourceDeviceId: string
+  targetDeviceId: string
 }
 
 const resumableEndpoint = (() => {
@@ -385,6 +511,8 @@ export async function uploadCloudFile(input: UploadFileInput): Promise<{ transfe
     mime_type: input.file.type || 'application/octet-stream',
     storage_key: storageKey,
     status: 'uploading',
+    current_stage: 'uploading',
+    protocol_version: TRANSFER_PROTOCOL_VERSION,
     bytes_transferred: 0,
     expires_at: expiresAt,
   })
@@ -433,8 +561,10 @@ export async function uploadCloudFile(input: UploadFileInput): Promise<{ transfe
 
     const { data: transferRow, error: transferError } = await client.from('transfers').update({
       status: 'waiting',
+      current_stage: 'waiting',
       bytes_transferred: input.file.size,
       checksum,
+      sender_ready_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }).eq('id', transferId).select('id,source_device_id,target_device_id,file_name,file_size,mime_type,status,bytes_transferred,storage_key,checksum,last_error_code,created_at,expires_at').single()
     if (transferError) throw transferError
@@ -462,23 +592,128 @@ export async function uploadCloudFile(input: UploadFileInput): Promise<{ transfe
     return { transfer: mapTransfer(transferRow as TransferRow), storageItem: mapStorage(storageRow as StorageRow) }
   } catch (error) {
     const message = error instanceof Error ? error.message : '上传失败'
-    await client.from('transfers').update({ status: 'failed', last_error_code: message.slice(0, 180), updated_at: new Date().toISOString() }).eq('id', transferId)
+    await client.from('transfers').update({ status: 'failed', current_stage: 'failed', failure_category: 'upload', last_error_code: message.slice(0, 180), updated_at: new Date().toISOString() }).eq('id', transferId)
+    throw error
+  }
+}
+
+export async function uploadCloudFileFromPath(input: UploadNativeFileInput): Promise<{ transfer: Transfer; storageItem: StorageItem }> {
+  if (input.file.size > 500 * 1024 ** 2) throw new Error('单个文件不能超过 500 MB')
+  if (!window.flowbridge) throw new Error('可靠文件传输仅支持 FlowBridge Windows 客户端')
+  const client = requireClient()
+  const session = await requireSession()
+  const { data: quotaRow, error: quotaError } = await client.from('storage_quotas').select('quota_bytes,used_bytes_cached').eq('user_id', session.user.id).single()
+  if (quotaError) throw quotaError
+  if (Number(quotaRow.used_bytes_cached) + input.file.size > Number(quotaRow.quota_bytes)) throw new Error('云端空间不足，请先清理文件或联系管理员调整配额')
+
+  const transferId = input.transferId ?? crypto.randomUUID()
+  const baseStorageKey = `${session.user.id}/${transferId}/${safeStorageFileName(input.file.name)}`
+  const chunkDescriptors = input.file.size > MAX_STORAGE_OBJECT_BYTES ? createChunkDescriptors(baseStorageKey, input.file.size) : []
+  const storageKey = chunkDescriptors.length ? chunkManifestKey(baseStorageKey) : baseStorageKey
+  const expiresAt = new Date(Date.now() + 7 * 86_400_000).toISOString()
+  const { error: transferStartError } = await client.from('transfers').upsert({
+    id: transferId,
+    user_id: session.user.id,
+    source_device_id: input.sourceDeviceId,
+    target_device_id: input.targetDeviceId,
+    file_name: input.file.name,
+    file_size: input.file.size,
+    mime_type: input.file.type || 'application/octet-stream',
+    storage_key: storageKey,
+    status: 'uploading',
+    current_stage: 'uploading',
+    protocol_version: TRANSFER_PROTOCOL_VERSION,
+    bytes_transferred: 0,
+    last_error_code: null,
+    expires_at: expiresAt,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'id' })
+  if (transferStartError) throw transferStartError
+
+  try {
+    const parts = chunkDescriptors.length
+      ? chunkDescriptors.map((chunk, index) => ({ key: chunk.key, start: index * MAX_STORAGE_OBJECT_BYTES, size: chunk.size }))
+      : [{ key: baseStorageKey, start: 0, size: input.file.size }]
+    const uploadResult = await window.flowbridge.uploadFile({
+      jobId: transferId,
+      filePath: input.file.path,
+      fileName: input.file.name,
+      fileSize: input.file.size,
+      fileMtimeMs: input.file.mtimeMs,
+      mimeType: input.file.type || 'application/octet-stream',
+      endpoint: new URL('/storage/v1/object', url!).toString().replace(/\/$/, ''),
+      bucket,
+      accessToken: session.access_token,
+      apiKey: publishableKey!,
+      parts,
+      manifestKey: chunkDescriptors.length ? storageKey : undefined,
+    })
+
+    const { data: transferRow, error: transferError } = await client.from('transfers').update({
+      status: 'waiting',
+      current_stage: 'waiting',
+      bytes_transferred: input.file.size,
+      checksum: uploadResult.checksum,
+      sender_ready_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }).eq('id', transferId).select('id,source_device_id,target_device_id,file_name,file_size,mime_type,status,bytes_transferred,storage_key,checksum,last_error_code,created_at,expires_at').single()
+    if (transferError) throw transferError
+
+    const { data: existingStorage, error: existingStorageError } = await client.from('storage_items').select('id').eq('transfer_id', transferId).is('deleted_at', null).maybeSingle()
+    if (existingStorageError) throw existingStorageError
+    const storageMutation = {
+      owner_id: session.user.id,
+      transfer_id: transferId,
+      storage_key: storageKey,
+      original_name: input.file.name,
+      mime_type: input.file.type || 'application/octet-stream',
+      size_bytes: input.file.size,
+      sha256: uploadResult.checksum,
+      category: categoryFor(input.file.type, input.file.name),
+      retention_type: 'temporary',
+      expires_at: expiresAt,
+      deleted_at: null,
+      updated_at: new Date().toISOString(),
+    }
+    const storageQuery = existingStorage
+      ? client.from('storage_items').update(storageMutation).eq('id', existingStorage.id).select().single()
+      : client.from('storage_items').insert(storageMutation).select().single()
+    const { data: storageRow, error: storageError } = await storageQuery
+    if (storageError) throw storageError
+
+    const { data: existingEvent, error: existingEventError } = await client.from('sync_events').select('id').eq('payload_ref', transferId).eq('event_type', 'file.ready').maybeSingle()
+    if (existingEventError) throw existingEventError
+    if (!existingEvent) {
+      const { error: eventError } = await client.from('sync_events').insert({
+        user_id: session.user.id,
+        source_device_id: input.sourceDeviceId,
+        target_device_id: input.targetDeviceId,
+        event_type: 'file.ready',
+        payload_ref: transferId,
+      })
+      if (eventError) throw eventError
+    }
+    return { transfer: mapTransfer(transferRow as TransferRow), storageItem: mapStorage(storageRow as StorageRow) }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '上传失败'
+    await client.from('transfers').update({ status: 'failed', current_stage: 'failed', failure_category: 'upload', last_error_code: message.slice(0, 180), updated_at: new Date().toISOString() }).eq('id', transferId)
     throw error
   }
 }
 
 export interface FileDownloadPlan {
   signedUrls: string[]
+  partSizes: number[]
   checksum?: string
 }
 
-export async function createFileDownload(storageKey: string): Promise<FileDownloadPlan> {
+export async function createFileDownload(storageKey: string, fileSize: number): Promise<FileDownloadPlan> {
   const client = requireClient()
   await requireSession()
   if (!isChunkManifestKey(storageKey)) {
     const { data, error } = await client.storage.from(bucket).createSignedUrl(storageKey, 3600, { download: true })
     if (error) throw error
-    return { signedUrls: [data.signedUrl] }
+    return { signedUrls: [data.signedUrl], partSizes: [fileSize] }
   }
   const { data: manifestBlob, error: manifestError } = await client.storage.from(bucket).download(storageKey)
   if (manifestError) throw manifestError
@@ -487,15 +722,44 @@ export async function createFileDownload(storageKey: string): Promise<FileDownlo
   if (error) throw error
   const signedUrls = data.map((item) => item.signedUrl).filter((value): value is string => Boolean(value))
   if (signedUrls.length !== manifest.chunks.length) throw new Error('无法生成完整的分片下载地址')
-  return { signedUrls, checksum: manifest.checksum }
+  return { signedUrls, partSizes: manifest.chunks.map((chunk) => chunk.size), checksum: manifest.checksum }
 }
 
 export async function markTransferCompleted(transferId: string, sourceDeviceId: string, targetDeviceId: string) {
   const client = requireClient()
   const session = await requireSession()
-  const { error } = await client.from('transfers').update({ status: 'completed', received_at: new Date().toISOString(), completed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', transferId)
+  const { error } = await client.from('transfers').update({ status: 'completed', current_stage: 'completed', received_at: new Date().toISOString(), receiver_ack_at: new Date().toISOString(), completed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', transferId)
   if (error) throw error
   await client.from('sync_events').insert({ user_id: session.user.id, source_device_id: sourceDeviceId, target_device_id: targetDeviceId, event_type: 'file.received', payload_ref: transferId })
+}
+
+export async function clearFinishedCloudTransfers() {
+  const client = requireClient()
+  await requireSession()
+  const { error } = await client.from('transfers').delete().in('status', ['completed', 'cancelled', 'expired'])
+  if (error) throw error
+}
+
+export async function recoverInterruptedCloudTransfers(deviceId: string) {
+  const client = requireClient()
+  const session = await requireSession()
+  const now = new Date().toISOString()
+  const { error: downloadError } = await client.from('transfers').update({
+    status: 'waiting',
+    current_stage: 'waiting',
+    failure_category: null,
+    last_error_code: null,
+    updated_at: now,
+  }).eq('user_id', session.user.id).eq('target_device_id', deviceId).eq('status', 'downloading')
+  if (downloadError) throw downloadError
+  const { error: uploadError } = await client.from('transfers').update({
+    status: 'failed',
+    current_stage: 'failed',
+    failure_category: 'interrupted',
+    last_error_code: '上次运行中断，正在自动恢复',
+    updated_at: now,
+  }).eq('user_id', session.user.id).eq('source_device_id', deviceId).in('status', ['queued', 'uploading'])
+  if (uploadError) throw uploadError
 }
 
 export async function deleteCloudStorageItem(item: StorageItem) {
@@ -572,6 +836,8 @@ export interface WorkspaceSyncHandlers {
   onIncomingClipboard: (item: ClipboardItem) => void
   onTransfers?: (items: Transfer[]) => void
   onIncomingTransfer?: (item: Transfer) => void
+  onConnectionState?: (state: CloudConnectionState, detail?: string) => void
+  isPaused?: () => boolean
   onError: (message: string) => void
 }
 
@@ -579,11 +845,24 @@ export async function startWorkspaceSync(handlers: WorkspaceSyncHandlers) {
   const client = requireClient()
   const session = await requireSession()
   const currentDeviceId = getOrCreateDeviceId()
-  await registerDevice({ id: currentDeviceId, name: handlers.deviceName, platform: 'Windows' })
   const transferColumns = 'id,source_device_id,target_device_id,file_name,file_size,mime_type,status,bytes_transferred,storage_key,checksum,last_error_code,created_at,expires_at'
+  const eventGuard = new EventDeliveryGuard()
+  let stopped = false
+  let connecting = false
+  let connectionState: CloudConnectionState = 'idle'
+  let reconnectAttempt = 0
+  let heartbeatFailures = 0
+  let generation = 0
+  let reconnectTimer: number | undefined
+  let channels: RealtimeChannel[] = []
+
+  const emitConnectionState = (state: CloudConnectionState, detail?: string) => {
+    connectionState = state
+    handlers.onConnectionState?.(state, detail)
+  }
 
   const refreshDevices = async () => {
-    const { data, error } = await client.from('devices').select('id,name,platform,last_seen_at,revoked_at').is('revoked_at', null).order('last_seen_at', { ascending: false })
+    const { data, error } = await client.from('devices').select('id,name,platform,last_seen_at,revoked_at,app_version,last_app_version,protocol_version').is('revoked_at', null).order('last_seen_at', { ascending: false })
     if (error) throw error
     handlers.onDevices((data as DeviceRow[]).map((row) => mapDevice(row, currentDeviceId)))
   }
@@ -598,22 +877,26 @@ export async function startWorkspaceSync(handlers: WorkspaceSyncHandlers) {
     if (error) throw error
     handlers.onTransfers((data as TransferRow[]).map(mapTransfer))
   }
-  const deliveredEvents = new Set<string>()
   const deliverEvent = async (event: { id: string; payload_ref: string | null; event_type: string }) => {
-    if (!event.payload_ref || deliveredEvents.has(event.id)) return
-    deliveredEvents.add(event.id)
-    if (event.event_type === 'clipboard.created') {
-      const { data, error } = await client.from('clipboard_items').select('id,source_device_id,target_device_id,content,content_hash,content_type,is_favorite,created_at').eq('id', event.payload_ref).single()
-      if (error) throw error
-      handlers.onIncomingClipboard(mapClipboard(data as ClipboardRow))
+    if (!event.payload_ref || handlers.isPaused?.() || !eventGuard.begin(event.id)) return
+    try {
+      if (event.event_type === 'clipboard.created') {
+        const { data, error } = await client.from('clipboard_items').select('id,source_device_id,target_device_id,content,content_hash,content_type,is_favorite,created_at').eq('id', event.payload_ref).single()
+        if (error) throw error
+        handlers.onIncomingClipboard(mapClipboard(data as ClipboardRow))
+      }
+      if (event.event_type === 'file.ready') {
+        const { data, error } = await client.from('transfers').select(transferColumns).eq('id', event.payload_ref).single()
+        if (error) throw error
+        handlers.onIncomingTransfer?.(mapTransfer(data as TransferRow))
+      }
+      const { error: acknowledgeError } = await client.from('sync_events').update({ status: 'acknowledged', acknowledged_at: new Date().toISOString() }).eq('id', event.id)
+      if (acknowledgeError) throw acknowledgeError
+      eventGuard.complete(event.id)
+    } catch (error) {
+      eventGuard.fail(event.id)
+      throw error
     }
-    if (event.event_type === 'file.ready') {
-      const { data, error } = await client.from('transfers').select(transferColumns).eq('id', event.payload_ref).single()
-      if (error) throw error
-      handlers.onIncomingTransfer?.(mapTransfer(data as TransferRow))
-    }
-    const { error: acknowledgeError } = await client.from('sync_events').update({ status: 'acknowledged', acknowledged_at: new Date().toISOString() }).eq('id', event.id)
-    if (acknowledgeError) throw acknowledgeError
   }
   const receivePending = async () => {
     const { data, error } = await client.from('sync_events').select('id,payload_ref,event_type').eq('target_device_id', currentDeviceId).in('event_type', ['clipboard.created', 'file.ready']).in('status', ['pending', 'delivered']).order('created_at', { ascending: true })
@@ -621,33 +904,155 @@ export async function startWorkspaceSync(handlers: WorkspaceSyncHandlers) {
     for (const event of data as Array<{ id: string; payload_ref: string | null; event_type: string }>) await deliverEvent(event)
   }
 
-  await Promise.all([refreshDevices(), loadHistory(), loadTransfers(), receivePending()])
-  const channels: RealtimeChannel[] = []
-  channels.push(client.channel(`flowbridge-events-${currentDeviceId}`)
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sync_events', filter: `target_device_id=eq.${currentDeviceId}` }, (payload) => {
-      const event = payload.new as { id: string; payload_ref: string | null; event_type: string }
-      if (event.event_type === 'clipboard.created' || event.event_type === 'file.ready') void deliverEvent(event).catch((error) => handlers.onError(error instanceof Error ? error.message : '接收内容失败'))
-    }).subscribe())
-  channels.push(client.channel(`flowbridge-devices-${session.user.id}`)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'devices', filter: `user_id=eq.${session.user.id}` }, () => {
-      void refreshDevices().catch((error) => handlers.onError(error instanceof Error ? error.message : '刷新设备失败'))
-    }).subscribe())
-  if (handlers.onTransfers) {
-    channels.push(client.channel(`flowbridge-transfers-${session.user.id}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'transfers', filter: `user_id=eq.${session.user.id}` }, () => {
-        void loadTransfers().catch((error) => handlers.onError(error instanceof Error ? error.message : '刷新文件失败'))
-      }).subscribe())
+  const reconcile = async () => {
+    await Promise.all([refreshDevices(), loadHistory(), loadTransfers()])
+    if (!handlers.isPaused?.()) await receivePending()
+    const { error } = await client.rpc('mark_device_reconciled', { p_device_id: currentDeviceId })
+    if (error) throw error
   }
 
-  const heartbeat = window.setInterval(() => {
+  const clearReconnectTimer = () => {
+    if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
+    reconnectTimer = undefined
+  }
+
+  const removeChannels = async () => {
+    const staleChannels = channels
+    channels = []
+    await Promise.all(staleChannels.map((channel) => client.removeChannel(channel).catch(() => undefined)))
+  }
+
+  const scheduleReconnect = (reason: string) => {
+    if (stopped || reconnectTimer !== undefined) return
+    const online = window.navigator.onLine
+    emitConnectionState(online ? 'reconnecting' : 'offline', reason)
+    const delay = online ? reconnectDelay(reconnectAttempt++) : 30_000
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = undefined
+      void connect()
+    }, delay)
+  }
+
+  async function connect() {
+    if (stopped || connecting) return
+    if (!window.navigator.onLine) {
+      scheduleReconnect('当前没有网络，恢复后会自动继续')
+      return
+    }
+    connecting = true
+    clearReconnectTimer()
+    const currentGeneration = ++generation
+    emitConnectionState(reconnectAttempt > 0 ? 'reconnecting' : 'connecting')
+    try {
+      await removeChannels()
+      await registerDevice({ id: currentDeviceId, name: handlers.deviceName, platform: 'Windows' })
+      await reconcile()
+      if (stopped || currentGeneration !== generation) return
+
+      const subscribed = new Set<string>()
+      const expectedSubscriptions = handlers.onTransfers ? 3 : 2
+      const watchStatus = (name: string) => (status: string, error?: Error) => {
+        if (stopped || currentGeneration !== generation) return
+        if (status === 'SUBSCRIBED') {
+          subscribed.add(name)
+          if (subscribed.size === expectedSubscriptions) {
+            reconnectAttempt = 0
+            heartbeatFailures = 0
+            emitConnectionState(handlers.isPaused?.() ? 'paused' : 'connected')
+            void reconcile().catch((reconcileError) => scheduleReconnect(reconcileError instanceof Error ? reconcileError.message : '补拉失败'))
+          }
+          return
+        }
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+          scheduleReconnect(error?.message ?? `实时通道 ${name} 已断开`)
+        }
+      }
+
+      const eventChannel = client.channel(`flowbridge-events-${currentDeviceId}`)
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sync_events', filter: `target_device_id=eq.${currentDeviceId}` }, (payload) => {
+          const event = payload.new as { id: string; payload_ref: string | null; event_type: string }
+          if (event.event_type === 'clipboard.created' || event.event_type === 'file.ready') {
+            void deliverEvent(event).catch((deliveryError) => handlers.onError(deliveryError instanceof Error ? deliveryError.message : '接收内容失败'))
+          }
+        })
+      channels.push(eventChannel)
+      eventChannel.subscribe(watchStatus('events'))
+
+      const deviceChannel = client.channel(`flowbridge-devices-${session.user.id}`)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'devices', filter: `user_id=eq.${session.user.id}` }, () => {
+          void refreshDevices().catch((refreshError) => handlers.onError(refreshError instanceof Error ? refreshError.message : '刷新设备失败'))
+        })
+      channels.push(deviceChannel)
+      deviceChannel.subscribe(watchStatus('devices'))
+
+      if (handlers.onTransfers) {
+        const transferChannel = client.channel(`flowbridge-transfers-${session.user.id}`)
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'transfers', filter: `user_id=eq.${session.user.id}` }, () => {
+            void loadTransfers().catch((refreshError) => handlers.onError(refreshError instanceof Error ? refreshError.message : '刷新文件失败'))
+          })
+        channels.push(transferChannel)
+        transferChannel.subscribe(watchStatus('transfers'))
+      }
+    } catch (error) {
+      handlers.onError(error instanceof Error ? error.message : '连接云端失败')
+      scheduleReconnect(error instanceof Error ? error.message : '连接云端失败')
+    } finally {
+      connecting = false
+    }
+  }
+
+  const reconnectNow = () => {
+    if (stopped) return
+    clearReconnectTimer()
+    reconnectAttempt = 0
+    void connect()
+  }
+  const handleOnline = () => reconnectNow()
+  const handleOffline = () => {
+    clearReconnectTimer()
+    emitConnectionState('offline', '当前没有网络，恢复后会自动继续')
+  }
+  const handleResumeSync = () => {
+    if (handlers.isPaused?.()) {
+      emitConnectionState('paused')
+      return
+    }
+    emitConnectionState(connectionState === 'connected' ? 'connected' : 'reconnecting')
+    void reconcile().catch((error) => scheduleReconnect(error instanceof Error ? error.message : '恢复同步失败'))
+  }
+
+  window.addEventListener('online', handleOnline)
+  window.addEventListener('offline', handleOffline)
+  window.addEventListener('focus', handleResumeSync)
+  window.addEventListener('flowbridge:sync-state-changed', handleResumeSync)
+  const reconcileTimer = window.setInterval(() => {
+    if (stopped || !window.navigator.onLine) return
+    void reconcile().catch((error) => scheduleReconnect(error instanceof Error ? error.message : '定时补拉失败'))
+  }, RECONCILE_INTERVAL_MS)
+  const heartbeatTimer = window.setInterval(() => {
+    if (stopped || !window.navigator.onLine || !['connected', 'paused'].includes(connectionState)) return
     void (async () => {
       const { error } = await client.rpc('heartbeat_device', { p_device_id: currentDeviceId })
       if (error) throw error
+      heartbeatFailures = 0
       await refreshDevices()
-    })().catch((error: unknown) => handlers.onError(error instanceof Error ? error.message : '设备心跳失败'))
-  }, 20_000)
+    })().catch((error: unknown) => {
+      heartbeatFailures += 1
+      if (heartbeatFailures >= 3) scheduleReconnect(error instanceof Error ? error.message : '设备心跳失败')
+    })
+  }, HEARTBEAT_INTERVAL_MS)
+
+  await connect()
   return () => {
-    window.clearInterval(heartbeat)
-    channels.forEach((channel) => { void client.removeChannel(channel) })
+    stopped = true
+    generation += 1
+    clearReconnectTimer()
+    window.clearInterval(reconcileTimer)
+    window.clearInterval(heartbeatTimer)
+    window.removeEventListener('online', handleOnline)
+    window.removeEventListener('offline', handleOffline)
+    window.removeEventListener('focus', handleResumeSync)
+    window.removeEventListener('flowbridge:sync-state-changed', handleResumeSync)
+    void removeChannels()
   }
 }
