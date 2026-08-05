@@ -1,6 +1,12 @@
 export type DeviceStatus = 'online' | 'offline'
-export type TransferStatus = 'queued' | 'uploading' | 'waiting' | 'completed' | 'failed' | 'cancelled' | 'expired'
+export type TransferStatus = 'queued' | 'uploading' | 'uploaded' | 'waiting' | 'downloading' | 'completed' | 'failed' | 'cancelled' | 'expired' | 'checksum_failed'
+export type TransferStage = 'queued' | 'hashing' | 'uploading' | 'waiting' | 'downloading' | 'verifying' | 'completed' | 'failed'
 export type ContentType = 'text' | 'prompt' | 'url'
+export type AccentColor = 'blue' | 'indigo' | 'teal' | 'orange' | 'rose' | 'graphite'
+export type InterfaceDensity = 'comfortable' | 'compact'
+export type StorageCategory = 'image' | 'video' | 'document' | 'archive' | 'other'
+export type UserRole = 'user' | 'admin' | 'super_admin'
+export type AccountStatus = 'active' | 'suspended' | 'deletion_pending'
 
 export interface Device {
   id: string
@@ -9,6 +15,8 @@ export interface Device {
   status: DeviceStatus
   isCurrent: boolean
   lastSeenAt: string
+  clientVersion?: string
+  protocolVersion?: number
 }
 
 export interface ClipboardItem {
@@ -31,9 +39,13 @@ export interface Transfer {
   mimeType: string
   status: TransferStatus
   progress: number
+  bytesTransferred?: number
+  storageKey?: string
   checksum?: string
   error?: string
   localPath?: string
+  localMtimeMs?: number
+  stage?: TransferStage
   createdAt: string
   expiresAt: string
 }
@@ -68,10 +80,85 @@ export interface Settings {
   syncPaused: boolean
   historyDays: number
   autoDownload: boolean
+  backgroundRun: boolean
+  launchAtStartup: boolean
+  autoUpdate: boolean
   textNotifications: boolean
   fileNotifications: boolean
   deviceNotifications: boolean
   previewNotifications: boolean
   theme: 'system' | 'light' | 'dark'
+  accent: AccentColor
+  fontScale: 0.9 | 1 | 1.1 | 1.25
+  density: InterfaceDensity
+  rememberLastPage: boolean
+  sidebarOrder: string[]
+  homeWidgets: string[]
+  defaultTargetDeviceId?: string
+  downloadDirectory?: string
+  meteredNetworkUploads: boolean
   reduceMotion: boolean
+  wallpaperPath?: string
+  wallpaperUrl?: string
+  wallpaperOverlay: number
+}
+
+export interface UserProfile {
+  id: string
+  email: string
+  displayName: string
+  avatarPath?: string
+  avatarUrl?: string
+  bio: string
+  locale: string
+  timezone: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface StorageQuota {
+  quotaBytes: number
+  usedBytes: number
+}
+
+export interface StorageItem {
+  id: string
+  ownerId: string
+  transferId?: string
+  storageKey: string
+  originalName: string
+  mimeType: string
+  sizeBytes: number
+  sha256: string
+  category: StorageCategory
+  retentionType: 'temporary' | 'saved'
+  expiresAt?: string
+  deletedAt?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface AdminUserSummary {
+  userId: string
+  email: string
+  displayName: string
+  accountStatus: AccountStatus
+  role: UserRole
+  createdAt: string
+  lastSignInAt?: string
+  deviceCount: number
+  storageUsed: number
+  storageQuota: number
+}
+
+export interface AuditLog {
+  id: string
+  actorId?: string
+  targetUserId?: string
+  action: string
+  resourceType: string
+  resourceId?: string
+  reason: string
+  result: 'success' | 'failed'
+  createdAt: string
 }

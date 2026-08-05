@@ -1,29 +1,25 @@
-# FlowBridge V0.2 进度
+# FlowBridge V0.3 进度
 
-## 开工回执
+## 目标
 
-- 目标：交付可运行、可评审、可继续接入真实云端的 Windows 优先 Electron MVP。
-- 顺序：安全壳与领域规则 → 核心交互 → Supabase 基础设施 → 自动化验证 → Git 发布。
-- 最大风险：当前没有 Supabase 项目凭据与真实双机环境，不能把本地演示冒充真实跨设备验收。
+- 在原 V0.2 软件上覆盖升级，不改变应用标识与本地数据键。
+- 完成 PRD V2.0 的界面重构、真实文件、个人主页、设置、存储和管理后台。
 
 ## 已完成
 
-- [x] PRD 范围、P0/P1 与非目标核验
-- [x] Electron 安全主进程与 preload 白名单
-- [x] React 工作台、剪贴板、文件、Prompt、设备、设置页面
-- [x] 本地持久化、去重、敏感提示、限制与文件状态机
-- [x] Supabase schema、私有 Storage、RLS、Realtime 事件与 heartbeat RPC
-- [x] 单元测试、CI、构建与安装配置
+- [x] Apple 风格原则下的浅色优先界面、统一留白与 ≥12px 可读字号
+- [x] 首页、剪贴板、文件、Prompt、存储、设备、个人主页、设置、管理后台
+- [x] 主题、强调色、字体、密度、首页卡片、导航顺序与通知自定义
+- [x] Supabase 私有 Storage、TUS 可恢复上传、SHA-256 流式校验、接收与另存为
+- [x] Profiles、Preferences、Quota、Storage Index、RBAC、账号状态与 Audit Log 迁移
+- [x] V0.2 本地数据自动迁移到 V0.3，保留原 appId 与安装目录
+- [x] 类型检查、lint（0 error）、5/5 单元测试、生产构建通过
+- [x] 1280×720 浅色/深色视觉回归：0 横向溢出、0 小于 12px 文本、0 控制台错误
+- [x] Windows NSIS 安装包：`FlowBridge-0.3.0-Setup.exe`，112,058,581 字节，SHA-256 `9C56FC03081F317D1DFB4873A321B8AC4B6290247F310C3C407FD54C988A3B26`
 
-## 待完成
+## 发布前
 
-- [x] 依赖安装；lint 0 错误；5/5 单测通过；typecheck 与生产 build 通过
-- [x] 欢迎页、工作台、文本发送、文件传输页真实浏览器回归，控制台 0 warning / error
-- [x] 生产依赖 `npm audit --omit=dev`：0 漏洞
-- [x] Windows NSIS 安装包生成：111,257,319 字节，SHA256 `8720C10DA7763F015F24EF4AB54F0A931B6667F1AC9BFDCF1B6C4A6175F8FE31`
-- [x] FlowBridge SVG/PNG 品牌图标与确定性生成脚本
-- [x] 初始化 Git、提交并推送到公开 GitHub 仓库
-- [x] Supabase 项目配置、数据库迁移与公开客户端配置
-- [x] 邮箱密码登录、真实设备注册、20 秒心跳与在线状态
-- [x] Realtime 双向文本传输、离线补收与事件确认
-- [x] 联网模式禁用尚未接入的模拟文件成功状态
+- [ ] 在生产 Supabase 执行 `202608020001_v03_platform.sql`
+- [ ] 把首个可信账号设为 `super_admin` 并实测管理后台
+- [ ] 两台 Windows 实测文本、文件上传、接收、校验与覆盖安装
+- [ ] 推送功能分支、合并并创建 GitHub v0.3.0 Release
