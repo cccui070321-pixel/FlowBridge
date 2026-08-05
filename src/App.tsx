@@ -8,7 +8,7 @@ import {
 } from 'lucide-react'
 import { formatBytes, relativeTime, validateFiles, validateText } from './lib/domain'
 import { APP_VERSION } from './lib/version'
-import { normalizeProfileImage } from './lib/profileImages'
+import { normalizeProfileImage, takeSelectedFile } from './lib/profileImages'
 import {
   adminRevokeDevices, adminSetAccountStatus, adminSetStorageQuota, adminSetUserRole,
   clearCloudClipboard, clearFinishedCloudTransfers, createFileDownload, deleteCloudClipboardItem, deleteCloudStorageItem, getCloudSession, isCloudConfigured, loadAccountSnapshot,
@@ -564,15 +564,18 @@ function ProfilePage({ showNotice, onLogout }: { showNotice: Notice; onLogout: (
   const { profile, accountEmail, devices, clipboardItems, transfers, patchProfile, settings, updateSettings } = useFlowStore()
   const [draft, setDraft] = useState({ displayName: profile?.displayName ?? accountEmail.split('@')[0], bio: profile?.bio ?? '', locale: profile?.locale ?? 'zh-CN', timezone: profile?.timezone ?? 'Asia/Shanghai' })
   const [assetBusy, setAssetBusy] = useState<'avatar' | 'wallpaper' | null>(null)
+  const [assetFeedback, setAssetFeedback] = useState<{ kind: 'avatar' | 'wallpaper'; type: 'info' | 'success' | 'error'; text: string } | null>(null)
   const avatarInput = useRef<HTMLInputElement>(null)
   const wallpaperInput = useRef<HTMLInputElement>(null)
   const save = async () => { try { if (isCloudConfigured) await updateCloudProfile(draft); patchProfile({ ...draft, updatedAt: new Date().toISOString() }); showNotice('个人资料已保存') } catch (error) { showNotice(error instanceof Error ? error.message : '保存失败', 'error') } }
   const uploadAsset = async (kind: 'avatar' | 'wallpaper', file?: File) => {
     if (!file) return
     setAssetBusy(kind)
+    setAssetFeedback({ kind, type: 'info', text: '正在读取并处理图片…' })
     try {
       const blob = await normalizeProfileImage(file, kind)
       if (isCloudConfigured) {
+        setAssetFeedback({ kind, type: 'info', text: '图片已处理，正在上传到你的私有空间…' })
         const previousPath = kind === 'avatar' ? profile?.avatarPath : settings.wallpaperPath
         const result = await uploadProfileAsset(kind, blob, previousPath)
         if (kind === 'avatar') patchProfile({ avatarPath: result.path, avatarUrl: result.url, updatedAt: new Date().toISOString() })
@@ -582,9 +585,13 @@ function ProfilePage({ showNotice, onLogout }: { showNotice: Notice; onLogout: (
         if (kind === 'avatar') patchProfile({ avatarUrl: localUrl })
         else updateSettings({ wallpaperUrl: localUrl })
       }
-      showNotice(kind === 'avatar' ? '头像已更新' : '壁纸已更新')
+      const successText = kind === 'avatar' ? '头像已更新并保存' : '壁纸已更新并保存'
+      setAssetFeedback({ kind, type: 'success', text: successText })
+      showNotice(successText)
     } catch (error) {
-      showNotice(error instanceof Error ? error.message : '图片上传失败', 'error')
+      const errorText = error instanceof Error ? error.message : '图片上传失败'
+      setAssetFeedback({ kind, type: 'error', text: `没有更新成功：${errorText}` })
+      showNotice(errorText, 'error')
     } finally {
       setAssetBusy(null)
     }
@@ -598,7 +605,7 @@ function ProfilePage({ showNotice, onLogout }: { showNotice: Notice; onLogout: (
       showNotice(kind === 'avatar' ? '已恢复默认头像' : '已恢复默认壁纸')
     } catch (error) { showNotice(error instanceof Error ? error.message : '恢复默认失败', 'error') }
   }
-  return <div className="profile-layout"><section className="profile-card"><input ref={avatarInput} type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={(event) => void uploadAsset('avatar', event.target.files?.[0])} /><button className="avatar-upload-button" disabled={assetBusy !== null} onClick={() => avatarInput.current?.click()}><UserAvatar name={draft.displayName} url={profile?.avatarUrl} size="xl" /><span>{assetBusy === 'avatar' ? '正在处理…' : '更换头像'}</span></button><h2>{draft.displayName || 'FlowBridge 用户'}</h2><p>{profile?.email || accountEmail}</p><div className="profile-stats"><div><strong>{devices.length}</strong><span>设备</span></div><div><strong>{clipboardItems.length}</strong><span>剪贴板</span></div><div><strong>{transfers.filter((item) => item.status === 'completed').length}</strong><span>已传文件</span></div></div>{profile?.avatarPath && <button className="text-button" onClick={() => void resetAsset('avatar')}>恢复默认头像</button>}<button className="secondary-button danger-text" onClick={() => void onLogout()}><LogOut size={18} />退出登录</button></section><section className="panel profile-form"><div className="panel-heading"><div><span className="card-kicker">个人资料</span><h2>让这个空间更像你</h2></div></div><div className="form-grid"><label>显示名称<input value={draft.displayName} onChange={(event) => setDraft({ ...draft, displayName: event.target.value })} maxLength={80} /></label><label>语言<select value={draft.locale} onChange={(event) => setDraft({ ...draft, locale: event.target.value })}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label><label className="full">个人简介<textarea value={draft.bio} onChange={(event) => setDraft({ ...draft, bio: event.target.value })} maxLength={280} placeholder="写一句关于你的工作方式…" /></label><label className="full">时区<select value={draft.timezone} onChange={(event) => setDraft({ ...draft, timezone: event.target.value })}><option value="Asia/Shanghai">中国标准时间（上海）</option><option value="Asia/Hong_Kong">香港时间</option><option value="Asia/Tokyo">日本标准时间</option><option value="America/Los_Angeles">太平洋时间</option></select></label></div><button className="primary-button" onClick={() => void save()}><Save size={18} />保存修改</button><div className="wallpaper-editor"><input ref={wallpaperInput} type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={(event) => void uploadAsset('wallpaper', event.target.files?.[0])} /><div className="wallpaper-preview" style={settings.wallpaperUrl ? { backgroundImage: `url("${settings.wallpaperUrl}")` } : undefined}><Image size={24} /><span>{settings.wallpaperUrl ? '当前自定义壁纸' : '默认背景'}</span></div><div><button className="secondary-button" disabled={assetBusy !== null} onClick={() => wallpaperInput.current?.click()}><Upload size={17} />{assetBusy === 'wallpaper' ? '正在处理…' : '上传壁纸'}</button>{settings.wallpaperPath && <button className="text-button" onClick={() => void resetAsset('wallpaper')}>恢复默认</button>}</div></div></section></div>
+  return <div className="profile-layout"><section className="profile-card"><input ref={avatarInput} type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={(event) => void uploadAsset('avatar', takeSelectedFile(event.currentTarget))} /><button type="button" className="avatar-upload-button" disabled={assetBusy !== null} onClick={() => avatarInput.current?.click()}><UserAvatar name={draft.displayName} url={profile?.avatarUrl} size="xl" /><span>{assetBusy === 'avatar' ? '正在处理…' : '更换头像'}</span></button>{assetFeedback?.kind === 'avatar' && <p className={`asset-feedback ${assetFeedback.type}`} role={assetFeedback.type === 'error' ? 'alert' : 'status'}>{assetFeedback.text}</p>}<h2>{draft.displayName || 'FlowBridge 用户'}</h2><p>{profile?.email || accountEmail}</p><div className="profile-stats"><div><strong>{devices.length}</strong><span>设备</span></div><div><strong>{clipboardItems.length}</strong><span>剪贴板</span></div><div><strong>{transfers.filter((item) => item.status === 'completed').length}</strong><span>已传文件</span></div></div>{profile?.avatarPath && <button className="text-button" onClick={() => void resetAsset('avatar')}>恢复默认头像</button>}<button className="secondary-button danger-text" onClick={() => void onLogout()}><LogOut size={18} />退出登录</button></section><section className="panel profile-form"><div className="panel-heading"><div><span className="card-kicker">个人资料</span><h2>让这个空间更像你</h2></div></div><div className="form-grid"><label>显示名称<input value={draft.displayName} onChange={(event) => setDraft({ ...draft, displayName: event.target.value })} maxLength={80} /></label><label>语言<select value={draft.locale} onChange={(event) => setDraft({ ...draft, locale: event.target.value })}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label><label className="full">个人简介<textarea value={draft.bio} onChange={(event) => setDraft({ ...draft, bio: event.target.value })} maxLength={280} placeholder="写一句关于你的工作方式…" /></label><label className="full">时区<select value={draft.timezone} onChange={(event) => setDraft({ ...draft, timezone: event.target.value })}><option value="Asia/Shanghai">中国标准时间（上海）</option><option value="Asia/Hong_Kong">香港时间</option><option value="Asia/Tokyo">日本标准时间</option><option value="America/Los_Angeles">太平洋时间</option></select></label></div><button className="primary-button" onClick={() => void save()}><Save size={18} />保存修改</button><div className="wallpaper-editor"><input ref={wallpaperInput} type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={(event) => void uploadAsset('wallpaper', takeSelectedFile(event.currentTarget))} /><div className="wallpaper-preview" style={settings.wallpaperUrl ? { backgroundImage: `url("${settings.wallpaperUrl}")` } : undefined}><Image size={24} /><span>{settings.wallpaperUrl ? '当前自定义壁纸' : '默认背景'}</span></div><div><button type="button" className="secondary-button" disabled={assetBusy !== null} onClick={() => wallpaperInput.current?.click()}><Upload size={17} />{assetBusy === 'wallpaper' ? '正在处理…' : '上传壁纸'}</button>{settings.wallpaperPath && <button className="text-button" onClick={() => void resetAsset('wallpaper')}>恢复默认</button>}{assetFeedback?.kind === 'wallpaper' && <p className={`asset-feedback ${assetFeedback.type}`} role={assetFeedback.type === 'error' ? 'alert' : 'status'}>{assetFeedback.text}</p>}</div></div></section></div>
 }
 
 function SettingRow({ title, detail, children }: { title: string; detail: string; children: ReactNode }) { return <div className="setting-row"><div><strong>{title}</strong><p>{detail}</p></div><div>{children}</div></div> }

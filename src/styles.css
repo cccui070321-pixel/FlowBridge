@@ -247,6 +247,10 @@ kbd { font-family:inherit;font-size:12px;border:1px solid var(--line);background
 .wallpaper-preview { min-height:112px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(145deg,var(--accent-soft),var(--surface-muted));background-size:cover;background-position:center;display:flex;align-items:center;justify-content:center;gap:9px;color:var(--secondary);overflow:hidden }
 .wallpaper-preview span { padding:5px 9px;border-radius:8px;background:color-mix(in srgb,var(--surface-solid) 78%,transparent);backdrop-filter:blur(9px) }
 .wallpaper-editor>div:last-child { display:flex;flex-direction:column;align-items:stretch;gap:6px }
+.asset-feedback { max-width:300px;margin:7px 0 0;font-size:max(13px,calc(13px * var(--font-scale)));line-height:1.45;color:var(--secondary) }
+.asset-feedback.info { color:var(--accent) }
+.asset-feedback.success { color:var(--success) }
+.asset-feedback.error { color:var(--danger) }
 
 .settings-layout { display:flex!important;flex-direction:column;gap:18px;max-width:980px!important }
 .settings-section { padding:8px 25px 4px }

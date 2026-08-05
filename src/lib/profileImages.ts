@@ -10,6 +10,12 @@ export function validateProfileImage(file: Pick<File, 'size' | 'type'>, kind: Pr
   return null
 }
 
+export function takeSelectedFile(input: Pick<HTMLInputElement, 'files' | 'value'>) {
+  const file = input.files?.[0]
+  input.value = ''
+  return file
+}
+
 function canvasBlob(canvas: HTMLCanvasElement) {
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('图片处理失败')), 'image/webp', 0.9)
@@ -19,7 +25,7 @@ function canvasBlob(canvas: HTMLCanvasElement) {
 export async function normalizeProfileImage(file: File, kind: ProfileImageKind) {
   const problem = validateProfileImage(file, kind)
   if (problem) throw new Error(problem)
-  const image = await createImageBitmap(file)
+  const image = await decodeProfileImage(file)
   try {
     const canvas = document.createElement('canvas')
     const context = canvas.getContext('2d')
@@ -28,15 +34,46 @@ export async function normalizeProfileImage(file: File, kind: ProfileImageKind) 
       const sourceSize = Math.min(image.width, image.height)
       canvas.width = 512
       canvas.height = 512
-      context.drawImage(image, (image.width - sourceSize) / 2, (image.height - sourceSize) / 2, sourceSize, sourceSize, 0, 0, 512, 512)
+      context.drawImage(image.source, (image.width - sourceSize) / 2, (image.height - sourceSize) / 2, sourceSize, sourceSize, 0, 0, 512, 512)
     } else {
       const scale = Math.min(1, 2560 / image.width, 1440 / image.height)
       canvas.width = Math.max(1, Math.round(image.width * scale))
       canvas.height = Math.max(1, Math.round(image.height * scale))
-      context.drawImage(image, 0, 0, canvas.width, canvas.height)
+      context.drawImage(image.source, 0, 0, canvas.width, canvas.height)
     }
     return await canvasBlob(canvas)
   } finally {
     image.close()
+  }
+}
+
+async function decodeProfileImage(file: File): Promise<{ source: CanvasImageSource; width: number; height: number; close: () => void }> {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const bitmap = await createImageBitmap(file)
+      return { source: bitmap, width: bitmap.width, height: bitmap.height, close: () => bitmap.close() }
+    } catch {
+      // Fall through to Chromium's regular image decoder for Windows formats/drivers
+      // that occasionally fail through createImageBitmap.
+    }
+  }
+
+  const objectUrl = URL.createObjectURL(file)
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const element = new Image()
+      element.onload = () => resolve(element)
+      element.onerror = () => reject(new Error('图片解码失败'))
+      element.src = objectUrl
+    })
+    return {
+      source: image,
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+      close: () => URL.revokeObjectURL(objectUrl),
+    }
+  } catch {
+    URL.revokeObjectURL(objectUrl)
+    throw new Error('无法读取这张图片，请换一张 JPG、PNG 或 WebP 图片重试')
   }
 }
